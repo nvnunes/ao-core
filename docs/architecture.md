@@ -11,6 +11,10 @@ execution and resumption.
 conversions. The caller supplies the calibration and applies any
 instrument-specific rounding. See the [photometry guide](photometry.md).
 
+`ao_core.stats` measures PSF images and cubes using physical metadata and
+returns unit-aware measurements. Callers supply the images and choose the
+measurements. See the [PSF measurement guide](stats.md).
+
 `ao_core.models.config` defines shared physical input records and decodes
 their AO INI fields. The INI and in-memory paths produce the same records.
 Consumers can supply guide stars and update case inputs through
@@ -23,9 +27,9 @@ projection, sensing, reconstruction, control, residual covariance, optics,
 and metric response. The sampling uncertainty model composes these components to
 estimate the uncertainty of PSF metrics averaged over finite exposures.
 Applications own instrument prescriptions, native data interpretation and
-simulation orchestration. AO Stats owns ordinary PSF metric measurements.
-AO Core owns the physical response and covariance propagation used in the
-sampling uncertainty model.
+simulation orchestration. The sampling uncertainty model uses physical
+response and covariance propagation to predict measurement variability.
+Measured values from supplied PSFs come from `ao_core.stats`.
 
 The package root exposes `__version__`. The
 [API guide](api.md) and [Python reference](reference/api.md) describe

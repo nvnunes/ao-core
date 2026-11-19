@@ -26,6 +26,7 @@ nav:
       - API: api.md
       - Result I/O: io.md
       - Photometry: photometry.md
+      - PSF measurements: stats.md
       - AO model configuration: model-configuration.md
       - AO scientific models: scientific-models.md
       - Architecture: architecture.md
@@ -33,4 +34,5 @@ nav:
       - Testing: testing.md
   - Reference:
       - Python API: reference/api.md
+      - PSF measurements: reference/stats.md
       - HDF5 result format: reference/hdf5.md

@@ -11,6 +11,7 @@ print(__version__)
 The [Python reference](reference/api.md) lists the installed exports. The
 [result I/O guide](io.md) explains how to use `ao_core.io`. The
 [photometry guide](photometry.md) explains how to use `ao_core.photometry`.
+The [PSF measurement guide](stats.md) explains how to use `ao_core.stats`.
 The [model configuration guide](model-configuration.md) explains how to use
 `ao_core.models.config`.
 The [scientific models guide](scientific-models.md) describes shared model

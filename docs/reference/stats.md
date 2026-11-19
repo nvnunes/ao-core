@@ -1,0 +1,79 @@
+# PSF Measurement Reference
+
+Import the measurement functions, types, and selectors from `ao_core.stats`.
+See the [PSF measurement guide](../stats.md) for examples and array shapes.
+
+## Types
+
+| Name | Contract |
+| --- | --- |
+| `PsfMetadata` | Full physical metadata required for Strehl; EE and FWHM also accept a pixel scale alone. |
+| `StatValue` | Astropy quantity returned by a measurement function. |
+| `PsfMetricName` | Metric name: `"sr"`, `"ee"`, or `"fwhm"`. |
+| `PsfPreprocessor` | Callable that accepts and returns a PSF cube. |
+| `PsfPreprocessOption` | A preprocessor, `"default"`, or `None`. |
+
+## Metric Constants
+
+| Name | Value |
+| --- | --- |
+| `STATS_METRIC_SR` | `"sr"` |
+| `STATS_METRIC_EE` | `"ee"` |
+| `STATS_METRIC_FWHM` | `"fwhm"` |
+| `STATS_METRICS` | `("sr", "ee", "fwhm")` |
+
+## Peak-estimation Constants
+
+| Name | Value |
+| --- | --- |
+| `PEAK_METHOD_GAUSSIAN_FIT` | `"gaussian_fit"` |
+| `PEAK_METHOD_PIXEL_MAX` | `"pixel_max"` |
+| `PEAK_METHOD_FOURIER_MAX` | `"fourier_max"` |
+| `PEAK_METHODS` | `("gaussian_fit", "pixel_max", "fourier_max")` |
+| `DEFAULT_PEAK_METHOD` | `"gaussian_fit"` |
+| `DEFAULT_PEAK_REFINEMENT_FACTOR` | `4` |
+
+## Enclosed-energy Constants
+
+| Name | Value |
+| --- | --- |
+| `EE_GEOMETRY_ENSQUARED` | `"ensquared"` |
+| `EE_GEOMETRY_ENCIRCLED` | `"encircled"` |
+| `EE_GEOMETRIES` | `("ensquared", "encircled")` |
+| `DEFAULT_EE_GEOMETRY` | `"ensquared"` |
+| `EE_CENTER_PEAK` | `"peak"` |
+| `EE_CENTER_IMAGE` | `"image"` |
+| `EE_CENTERS` | `("peak", "image")` |
+| `DEFAULT_EE_CENTER` | `"peak"` |
+
+## FWHM Constants
+
+| Name | Value |
+| --- | --- |
+| `STATS_FWHM_METHOD_CONTOUR` | `"contour"` |
+| `STATS_FWHM_METHOD_FOURIER_CONTOUR` | `"fourier_contour"` |
+| `STATS_FWHM_METHODS` | `("contour", "fourier_contour")` |
+| `DEFAULT_FWHM_METHOD` | `"contour"` |
+| `DEFAULT_FWHM_REFINEMENT_FACTOR` | `4` |
+| `STATS_FWHM_SUMMARY_GEOM` | `"geom"` |
+| `STATS_FWHM_SUMMARY_MEAN` | `"mean"` |
+| `STATS_FWHM_SUMMARY_MAX` | `"max"` |
+| `STATS_FWHM_SUMMARY_MIN` | `"min"` |
+| `STATS_FWHM_SUMMARIES` | `("geom", "mean", "max", "min")` |
+| `DEFAULT_FWHM_SUMMARY` | `"geom"` |
+
+## Package Version
+
+`__version__` contains the installed AO Core version.
+
+## Classes and Functions
+
+::: ao_core.stats
+    options:
+      members:
+        - PsfMetadata
+        - clip_and_sum_normalize_psfs
+        - compute_psf_stats
+        - compute_psf_sr
+        - compute_psf_ee
+        - compute_psf_fwhm

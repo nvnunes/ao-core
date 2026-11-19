@@ -1,5 +1,7 @@
 # Python Reference
 
+See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
+
 ::: ao_core
     options:
       members:

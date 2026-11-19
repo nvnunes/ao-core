@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if [ ! -x "$repo_root/.conda/bin/python" ]; then
+  echo "Run ./scripts/bootstrap.sh before committing."
+  exit 1
+fi
+
+"$repo_root/.conda/bin/python" -m pytest -q
+"$repo_root/.conda/bin/ruff" check src tests
+"$repo_root/.conda/bin/mkdocs" build --strict

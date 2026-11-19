@@ -13,3 +13,5 @@ The [Python reference](reference/api.md) lists the installed exports. The
 [photometry guide](photometry.md) explains how to use `ao_core.photometry`.
 The [model configuration guide](model-configuration.md) explains how to use
 `ao_core.models.config`.
+The [scientific models guide](scientific-models.md) describes shared model
+components and the sampling predictor.

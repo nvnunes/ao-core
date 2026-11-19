@@ -16,6 +16,15 @@ their AO INI fields. Consumers apply the defaults and projections required
 by their calculations and interpret their own INI fields. See the
 [model configuration guide](model-configuration.md).
 
+`ao_core.models` provides reusable calculations for atmosphere, pupil
+projection, sensing, reconstruction, control, residual covariance, optics,
+and metric response. The sampling predictor composes these components to
+estimate the uncertainty of PSF metrics averaged over finite exposures.
+Applications own instrument prescriptions, native data interpretation and
+simulation orchestration. AO Stats owns ordinary PSF metric measurements.
+AO Core owns the physical response and covariance propagation used in the
+predictor.
+
 The package root exposes `__version__`. The
 [API guide](api.md) and [Python reference](reference/api.md) describe
 supported interfaces.

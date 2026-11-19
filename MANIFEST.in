@@ -3,3 +3,4 @@ include .githooks/pre-commit
 recursive-include docs *.md
 recursive-include scripts *.sh
 recursive-include tests *.py
+recursive-include tests/parity *.npz

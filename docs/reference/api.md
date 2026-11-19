@@ -25,3 +25,23 @@
         - magnitudes_to_photons_per_frame
         - photons_per_frame_to_magnitudes
         - magnitudes_to_effective_photons_per_second
+
+::: ao_core.models.config
+    options:
+      members:
+        - AOConfiguration
+        - AtmosphereConfig
+        - DetectorConfig
+        - FittingConfig
+        - LensletConfig
+        - LoopConfig
+        - SourceConfig
+        - TelescopeConfig
+        - ini_to_mapping
+        - load_ao_configuration
+        - parse_ini
+        - polar_to_cartesian
+        - read_ini
+        - read_ini_array
+        - read_ini_scalar
+        - resolve_ini_path

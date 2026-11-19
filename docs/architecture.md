@@ -11,6 +11,11 @@ execution and resumption.
 conversions. The caller supplies the calibration and applies any
 instrument-specific rounding. See the [photometry guide](photometry.md).
 
+`ao_core.models.config` defines shared physical input records and decodes
+their AO INI fields. Consumers apply the defaults and projections required
+by their calculations and interpret their own INI fields. See the
+[model configuration guide](model-configuration.md).
+
 The package root exposes `__version__`. The
 [API guide](api.md) and [Python reference](reference/api.md) describe
 supported interfaces.

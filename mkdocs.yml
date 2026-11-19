@@ -26,6 +26,7 @@ nav:
       - API: api.md
       - Result I/O: io.md
       - Photometry: photometry.md
+      - AO model configuration: model-configuration.md
       - Architecture: architecture.md
       - Development: development.md
       - Testing: testing.md

@@ -29,12 +29,14 @@
 ::: ao_core.models.config
     options:
       members:
-        - AOConfiguration
+        - Configuration
         - AtmosphereConfig
         - DetectorConfig
         - FittingConfig
         - LensletConfig
         - LoopConfig
+        - NaturalGuideStar
+        - Pupil
         - SourceConfig
         - TelescopeConfig
         - ini_to_mapping
@@ -115,9 +117,12 @@
 ::: ao_core.models.uncertainty
     options:
       members:
-        - SamplingConfiguration
-        - SamplingMetric
-        - SamplingNumerics
-        - SamplingPredictor
-        - SamplingRequest
-        - SamplingResult
+        - FastSettings
+        - SamplingSettings
+        - SamplingUncertaintyModel
+        - UncertaintyDiagnostics
+        - UncertaintyMetricPrediction
+        - UncertaintyModelSettings
+        - UncertaintyPrediction
+        - UncertaintyRequest
+        - gaussian_ngs_noise_covariance

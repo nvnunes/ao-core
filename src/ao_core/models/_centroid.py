@@ -196,14 +196,15 @@ class DirectCentroid:
     Flux arrays have shape (batch, 25) and are in photons. The calibrated
     centroid conversion is a 2-by-2 angular-per-pixel matrix in x/y order.
     Supply a scalar photon bound at least as large as every individual
-    pixel expectation, positive read noise and threshold in electrons, and
+    pixel expectation, positive read noise and a threshold in electrons, and
     the number of denominator quadrature nodes.
-    With the default read noise and threshold, rows with at least 1,000
-    expected detector photons use the finite Laplace interval
-    0 <= s <= 64 / minimum group flux. Bright rows are grouped by factors of
-    two in flux. Fainter rows and custom detector settings integrate over the
-    positive half-line. Custom settings raise FloatingPointError if the
-    quadrature cannot resolve the centroid denominator mass.
+    Rows with at least 1,000 expected detector photons use finite Laplace
+    quadrature for the default detector settings or a zero threshold. The
+    interval scales with incident flux for the default settings and with
+    the expected clipped pixel sum for a zero threshold. Fainter rows and
+    other detector settings use the positive half-line. Custom settings
+    raise FloatingPointError if the quadrature cannot resolve the centroid
+    denominator mass.
     """
 
     def __init__(
@@ -275,19 +276,17 @@ class DirectCentroid:
             or flux.min() < 0
         ):
             raise ValueError("Expected finite nonnegative batch-by-25 pixel counts")
-        if (self.read_noise, self.threshold) != (0.5, 0.5):
-            # The native bright interval scales with incident photons. A
-            # different threshold can make the detected denominator much smaller.
-            result = self._integrate(flux, jacobian=jacobian)
-            if np.any(np.abs(result["mass_error"]) > 1e-8):
-                raise FloatingPointError(
-                    "Centroid quadrature did not resolve the denominator mass"
-                )
-            return result
         total = flux.sum(axis=1)
-        bright = total >= 1000.0
+        default_detector = (self.read_noise, self.threshold) == (0.5, 0.5)
+        bright = (total >= 1000.0) & (default_detector or self.threshold == 0.0)
         if not bright.any():
             return self._integrate(flux, jacobian=jacobian)
+        if self.threshold == 0.0:
+            _, clipped_mean, _ = clipped_normal_laplace(
+                self.counts, [0.0], sigma=self.read_noise, threshold=0.0
+            )
+            probability = poisson.pmf(self.counts, flux[bright, :, None])
+            total[bright] = (probability @ clipped_mean[:, 0]).sum(axis=1)
         levels = np.full(len(flux), -1, dtype=int)
         levels[bright] = np.floor(np.log2(total[bright] / 1000.0)).astype(int)
         combined = {}
@@ -352,6 +351,14 @@ class DirectCentroid:
         )
         mass = np.einsum("bt,bt,t->b", product, ratio.sum(axis=1), weights)
         answer["mass_error"] = mass - nonempty
+        if (self.read_noise, self.threshold) != (0.5, 0.5) and np.any(
+            np.abs(answer["mass_error"]) > 1e-8
+        ):
+            if upper is not None:
+                return self._integrate(flux, jacobian=jacobian)
+            raise FloatingPointError(
+                "Centroid quadrature did not resolve the denominator mass"
+            )
         if jacobian:
             d0, d1 = [(probability @ x).reshape(shape) for x in differences]
             derivative = np.einsum(

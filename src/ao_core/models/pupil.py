@@ -225,10 +225,20 @@ def raw_modes(pupil, labels, diameter):
     return np.asarray(rows)
 
 
-def optical_pupil(amplitude, opd_nm, support_m, diameter_m, wavelength_m, side, order):
+def optical_pupil(
+    amplitude,
+    opd_nm,
+    support_m,
+    diameter_m,
+    wavelength_m,
+    side,
+    order,
+    *,
+    reference_side=64,
+):
     """Sample the optical pupil on a separate grid and retain the physical basis."""
     inputs = (amplitude, opd_nm, support_m, diameter_m, wavelength_m)
-    reference = make_pupil(*inputs, 64, order, fourier_response=False)
+    reference = make_pupil(*inputs, reference_side, order, fourier_response=False)
     coarse = make_pupil(*inputs, side, order, fourier_response=False)
     raw = raw_modes(reference, reference.labels, diameter_m)
     # Include piston when recovering the reference pupil's mean-subtracted modes.

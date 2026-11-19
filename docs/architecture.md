@@ -12,18 +12,20 @@ conversions. The caller supplies the calibration and applies any
 instrument-specific rounding. See the [photometry guide](photometry.md).
 
 `ao_core.models.config` defines shared physical input records and decodes
-their AO INI fields. Consumers apply the defaults and projections required
-by their calculations and interpret their own INI fields. See the
-[model configuration guide](model-configuration.md).
+their AO INI fields. The INI and in-memory paths produce the same records.
+Consumers can supply guide stars and update case inputs through
+`Configuration.with_updates()`. Model preparation applies the geometry
+for the effective case. Applications interpret their own INI fields and
+resolve their own providers. See the [model configuration guide](model-configuration.md).
 
 `ao_core.models` provides reusable calculations for atmosphere, pupil
 projection, sensing, reconstruction, control, residual covariance, optics,
-and metric response. The sampling predictor composes these components to
+and metric response. The sampling uncertainty model composes these components to
 estimate the uncertainty of PSF metrics averaged over finite exposures.
 Applications own instrument prescriptions, native data interpretation and
 simulation orchestration. AO Stats owns ordinary PSF metric measurements.
 AO Core owns the physical response and covariance propagation used in the
-predictor.
+sampling uncertainty model.
 
 The package root exposes `__version__`. The
 [API guide](api.md) and [Python reference](reference/api.md) describe

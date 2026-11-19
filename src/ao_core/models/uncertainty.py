@@ -5,28 +5,27 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
+from math import ceil
 from types import MappingProxyType
 
 import numpy as np
 from astropy import units as u
 from scipy.linalg import block_diag
 
-from ._all_order import SOBOL_POWER, SOBOL_REPLICATES, SOBOL_SEED
-from ._compact_optics import (
-    LEVELS,
-    MAX_EXPOSURE,
-    MAX_MPS_EXPOSURE,
-    CompactScienceOptics,
-    CPUCompactFastBatch,
-    fast_grid_device,
-    science_grid,
-)
-from ._explicit_optics import ExplicitScienceOptics
+from ._compact_optics import CompactScienceOptics
 from ._exposure import atmospheric_lags, integrate_metric_lags
 from ._field_covariance import _required
-from ._units import _count, _PhysicalRecord, _quantity, validate_float_dtype
-from .config import AOConfiguration
+from ._metric_covariance import (
+    LEVELS,
+    CPUCompactFastBatch,
+    metric_lag_indices,
+    predict_metric_lags,
+)
+from ._sampling_grid import SamplingSettings
+from ._units import _PhysicalRecord, _quantity, validate_float_dtype
+from .config import Configuration
 from .control import integrator_noise_lags
 from .pupil import ARCSEC, make_pupil, optical_pupil
 from .residual import FieldCovariance
@@ -38,261 +37,128 @@ from .sensing import (
 )
 
 __all__ = [
-    "SamplingConfiguration",
-    "SamplingMetric",
-    "SamplingNumerics",
-    "SamplingPredictor",
-    "SamplingRequest",
-    "SamplingResult",
+    "FastSettings",
+    "SamplingSettings",
+    "SamplingUncertaintyModel",
+    "UncertaintyDiagnostics",
+    "UncertaintyMetricPrediction",
+    "UncertaintyModelSettings",
+    "UncertaintyPrediction",
+    "UncertaintyRequest",
+    "gaussian_ngs_noise_covariance",
 ]
 
 _METRIC_UNITS = {"sr": u.one, "ee100": u.one, "fwhm_mas": u.mas}
 _MAS_PER_RADIAN = 180 / np.pi * 3600000
 _LAG_BATCH_BYTES = 256 * 1024**2
 _MAX_FAST_OPTICS = 8
-_EXPLICIT_MODELS = ("limited-order", "all-order", "full-pupil")
+MAX_MPS_EXPOSURE = 10.0
+_SCIENCE_ANGULAR_OFFSET = 0.5
 
 
-@dataclass(frozen=True, kw_only=True, eq=False)
-class SamplingConfiguration(_PhysicalRecord):
-    """Physical state shared by sampling predictions across field and wavelength.
+class UncertaintyModelSettings:
+    """Base type for options specific to an uncertainty model."""
 
-    Supply telescope diameter, layered atmosphere, fitting field, projected
-    LGS beacon height, and the HO and LO controllers through `physical`.
-    The low-order detector supplies pixel pitch, incident photons per frame,
-    read noise and threshold for the design prior. The NGS source record
-    supplies positions and the sensing wavelength. The runtime detector
-    statistics use the explicit runtime read noise and threshold.
-    """
-
-    physical: AOConfiguration
-    pupil_amplitude: np.ndarray
-    pupil_support: u.Quantity
-    static_opd: u.Quantity
-    guide_star_ee: u.Quantity
-    guide_star_fwhm: u.Quantity
-    frame_interval: u.Quantity
-    runtime_read_noise: u.Quantity = 0.5 * u.electron
-    runtime_threshold: u.Quantity = 0.5 * u.electron
-
-    def __post_init__(self):
-        if not isinstance(self.physical, AOConfiguration):
-            raise TypeError("physical must be an AOConfiguration")
-        for key, unit, ndim in (
-            ("pupil_support", u.m, 0),
-            ("static_opd", u.nm, 2),
-            ("guide_star_ee", u.one, 1),
-            ("guide_star_fwhm", u.mas, 1),
-            ("frame_interval", u.s, 0),
-            ("runtime_read_noise", u.electron, 0),
-            ("runtime_threshold", u.electron, 0),
-        ):
-            object.__setattr__(
-                self, key, _quantity(getattr(self, key), unit, key, ndim)
-            )
-        pupil = np.asarray(self.pupil_amplitude)
-        if (
-            pupil.ndim != 2
-            or pupil.shape != self.static_opd.shape
-            or pupil.shape[0] != pupil.shape[1]
-            or pupil.shape[0] < 3
-            or pupil.dtype.kind not in "fiu"
-            or not np.isfinite(pupil).all()
-            or np.any(pupil < 0)
-            or not np.any(pupil > 0)
-        ):
-            raise ValueError(
-                "Require a finite nonnegative square pupil matching static_opd"
-            )
-        object.__setattr__(
-            self,
-            "pupil_amplitude",
-            np.frombuffer(pupil.tobytes(), dtype=pupil.dtype).reshape(pupil.shape),
-        )
-        if (
-            min(
-                self.frame_interval.value,
-                self.pupil_support.value,
-                self.runtime_read_noise.value,
-            )
-            <= 0
-        ):
-            raise ValueError(
-                "Require positive pupil support, frame interval and read noise"
-            )
-
-        physical = self.physical
-        _required(physical.telescope, "Telescope", "diameter")
-        ngs = _required(
-            physical.low_order_sources, "Guide stars", "directions", "wavelengths"
-        )
-        detector = _required(
-            physical.low_order_detector,
-            "Guide-star detector",
-            "pixel_scale",
-            "read_noise",
-            "threshold",
-            "photons_per_frame",
-        )
-        if len(ngs.wavelengths) != 1:
-            raise ValueError("Require one shared guide-star sensing wavelength")
-        if not (
-            len(ngs.directions)
-            == len(detector.photons_per_frame)
-            == len(self.guide_star_ee)
-            == len(self.guide_star_fwhm)
-        ):
-            raise ValueError("Flux, EE and FWHM must match the ordered guide stars")
-        if np.any(self.guide_star_ee.value <= 0) or np.any(
-            self.guide_star_ee.value > 1
-        ):
-            raise ValueError("Guide-star EE must be a positive fraction")
-        if np.any(self.guide_star_fwhm.value <= 0):
-            raise ValueError("Guide-star FWHM must be positive")
-        for loop in (physical.high_order_loop, physical.low_order_loop):
-            _required(loop, "Controller", "gain", "delay_frames", "frame_rate")
-            if not np.isclose(
-                loop.frame_interval.to_value(u.s),
-                self.frame_interval.value,
-                rtol=0,
-                atol=1e-12,
-            ):
-                raise ValueError(
-                    "The guide-star loops must match the native frame interval"
-                )
+    __slots__ = ()
 
 
 @dataclass(frozen=True, kw_only=True)
-class SamplingNumerics:
-    """Explicit pupil and Fourier sampling for peak-centered metric measurements.
-
-    The spectral period must span at least twice the longest requested
-    exposure. Limited order can use the modal or restored mean. All order
-    and full pupil use the restored mean for one native frame.
+class FastSettings(UncertaintyModelSettings):
+    """Optional Fast settings.
 
     Attributes:
-        physical_side: Pupil samples along one side for modal projection.
-        optical_side: Pupil samples along one side for science optics.
-        sensor_side: Pupil samples along one side for guide-star optics.
-        modal_order: Maximum radial modal order, one of 5, 7, 9 or 11.
-        radial_order: Radial quadrature order for the modal grid.
-        angular_order: Azimuthal quadrature order for the science grid.
-        spectral_period_s: Fourier series period in seconds.
-        spectral_interval_s: Temporal sampling interval in seconds that sets the spectral Nyquist limit.
-        angular_offset: Science ring offset in azimuthal grid steps.
-        sensor_angular_order: Azimuthal quadrature order for sensing.
-        sensor_workers: Independent workers for sensor optical derivatives.
-        full_radial_order: Radial order of the explicit full-pupil grid.
-        tail_order: Limited-order Gaussian expansion order, either 4 or 6.
-        restore_mean: Use the restored mean in the limited-order calculation.
-        sobol_power: Base-2 logarithm of the number of quartets per scramble.
-        sobol_replicates: Number of independent scrambles.
-        sobol_seed: Reproducible scramble seed.
-        sobol_workers: Independent workers for the Sobol scrambles.
+        remove_science_tilt: Remove science tilt from the mean PSF and its
+            fluctuations.
     """
 
-    physical_side: int
-    optical_side: int
-    sensor_side: int
-    modal_order: int
-    radial_order: int
-    angular_order: int
-    spectral_period_s: float
-    spectral_interval_s: float
-    angular_offset: float = 0.0
-    sensor_angular_order: int = 48
-    sensor_workers: int = 1
-    full_radial_order: int = 160
-    tail_order: int = 6
-    restore_mean: bool = False
-    sobol_power: int = SOBOL_POWER
-    sobol_replicates: int = SOBOL_REPLICATES
-    sobol_seed: int = SOBOL_SEED
-    sobol_workers: int = 1
+    remove_science_tilt: bool = False
 
     def __post_init__(self):
-        for name, minimum in (
-            ("physical_side", 3),
-            ("optical_side", 3),
-            ("sensor_side", 3),
-            ("radial_order", 1),
-            ("angular_order", 1),
-            ("sensor_angular_order", 1),
-            ("full_radial_order", 1),
-            ("sobol_power", 10),
-            ("sobol_replicates", 4),
-            ("sobol_seed", 0),
-            ("modal_order", 1),
-            ("tail_order", 1),
-            ("sobol_workers", 1),
-            ("sensor_workers", 1),
-        ):
-            _count(getattr(self, name), name, minimum)
-        if (
-            self.modal_order not in (5, 7, 9, 11)
-            or self.tail_order not in (4, 6)
-            or not 1 <= self.sobol_workers <= 4
-            or not 1 <= self.sensor_workers <= 4
-        ):
-            raise ValueError("Invalid modal order, tail order or worker count")
-        times = (self.spectral_period_s, self.spectral_interval_s)
-        if not np.isfinite((*times, self.angular_offset)).all() or min(times) <= 0:
-            raise ValueError(
-                "Require a finite angular offset and positive spectral times"
-            )
+        if not isinstance(self.remove_science_tilt, bool):
+            raise TypeError("remove_science_tilt must be a boolean")
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class SamplingRequest(_PhysicalRecord):
+class UncertaintyRequest(_PhysicalRecord):
     """Predict the requested exposures in the supplied field and window order.
 
     Positions are (point, 2) angular x/y pairs. Exposures are a vector of
-    whole-frame durations. Science wavelength and pixel scale specify the
-    PSF used for the observables. Fast uses finite-order covariance, Balanced
-    retains all orders of the modal phase, and Full includes covariance of the
-    restored pupil phase. All use the same restored mean PSF.
+    whole-frame durations. The science wavelength and pupil geometry
+    determine the PSF pixel scale.
+
+    Fast uses finite-order covariance, Balanced retains all orders of the
+    modal phase, and Full includes covariance of the restored pupil phase.
+    All three use automatic numerical grids, the restored mean PSF, and
+    source-centered EE100.
+
+    Attributes:
+        config: Shared AO system, resolved pupil, NGSs and sampling settings.
+        ngs_noise_covariance: Pre-filter angular measurement-noise covariance
+            used for the LO reconstructor weights. Axes are interleaved x/y
+            in configured NGS order. Required for multiple guide stars.
+        positions: Ordered field coordinates as angular x/y pairs.
+        exposures: Ordered positive whole-frame exposure durations.
+        wavelength: Science wavelength.
+        model_type: Fast, Balanced, or Full.
+        model_settings: Optional FastSettings for Fast. Balanced and Full
+            use None.
     """
 
-    configuration: SamplingConfiguration
+    config: Configuration
+    ngs_noise_covariance: u.Quantity | None = None
+    wavelength: u.Quantity
     positions: u.Quantity
     exposures: u.Quantity
-    wavelength: u.Quantity
-    pixel_scale: u.Quantity
-    model: str = "fast"
-    remove_science_tilt: bool = False
-    numerics: SamplingNumerics | None = None
+    model_type: str = "fast"
+    model_settings: UncertaintyModelSettings | None = None
 
     def __post_init__(self):
-        if not isinstance(self.configuration, SamplingConfiguration):
-            raise TypeError("configuration must be a SamplingConfiguration")
+        if not isinstance(self.config, Configuration):
+            raise TypeError("config must be a Configuration")
+        if not self.config.ngs:
+            raise ValueError("Sampling requires at least one configured NGS")
+        if self.config.pupil is None:
+            raise ValueError("Sampling requires a resolved pupil")
+        _required(self.config.telescope, "Telescope", "diameter")
+        noise = self.ngs_noise_covariance
+        if noise is None:
+            if len(self.config.ngs) > 1:
+                raise ValueError("Multiple guide stars require ngs_noise_covariance")
+        else:
+            noise = _quantity(noise, u.mas**2, "ngs_noise_covariance", 2)
+            channels = 2 * len(self.config.ngs)
+            if noise.shape != (channels, channels) or not np.allclose(
+                noise.value, noise.value.T
+            ):
+                raise ValueError(
+                    "ngs_noise_covariance must be symmetric with two axes per NGS"
+                )
+            eigenvalues = np.linalg.eigvalsh(noise.value)
+            if eigenvalues[0] < -1e-12 * max(1, eigenvalues[-1]):
+                raise ValueError("ngs_noise_covariance must be positive semidefinite")
+            object.__setattr__(self, "ngs_noise_covariance", noise)
         for key, unit, ndim in (
             ("positions", u.arcsec, 2),
             ("exposures", u.s, 1),
             ("wavelength", u.m, 0),
-            ("pixel_scale", u.mas / u.pix, 0),
         ):
             object.__setattr__(
                 self, key, _quantity(getattr(self, key), unit, key, ndim)
             )
         if self.positions.shape[1] != 2:
             raise ValueError("Require x/y pairs for positions")
-        if not isinstance(self.model, str):
-            raise TypeError("model must be a string")
-        object.__setattr__(self, "model", self.model.casefold())
-        if self.numerics is None:
-            if self.model not in LEVELS:
-                raise ValueError(
-                    "Use Fast, Balanced or Full for automatic numerical grids"
-                )
-        elif not isinstance(self.numerics, SamplingNumerics):
-            raise TypeError("numerics must be a SamplingNumerics")
-        elif self.model not in _EXPLICIT_MODELS:
-            raise ValueError(
-                "Use limited-order, all-order or full-pupil with an explicit grid"
-            )
-        if self.remove_science_tilt and self.model != "fast":
-            raise ValueError("Science tilt removal requires the Fast model")
-        dt = self.configuration.frame_interval.value
+        if not isinstance(self.model_type, str):
+            raise TypeError("model_type must be a string")
+        model_type = self.model_type.casefold()
+        object.__setattr__(self, "model_type", model_type)
+        if model_type not in LEVELS:
+            raise ValueError(f"Unknown sampling model_type: {model_type}")
+        if self.model_settings is not None:
+            if model_type != "fast":
+                raise TypeError(f"{model_type} requires model_settings=None")
+            if type(self.model_settings) is not FastSettings:
+                raise TypeError("fast requires FastSettings")
+        dt = _sampling_frame_interval(self.config)
         counts = np.rint(self.exposures.value / dt)
         if np.any(counts < 1) or not np.allclose(
             counts * dt, self.exposures.value, rtol=0, atol=1e-12
@@ -300,82 +166,204 @@ class SamplingRequest(_PhysicalRecord):
             raise ValueError(
                 "Exposures must contain a positive number of whole native frames"
             )
-        if self.numerics is None and max(self.exposures.value) > MAX_EXPOSURE:
-            raise ValueError(
-                "Automatic numerical grids cover exposures through 20 seconds"
-            )
-        if self.numerics is not None:
-            if 2 * max(self.exposures.value) > self.numerics.spectral_period_s:
-                raise ValueError(
-                    "Spectral period must cover at least two full exposures"
-                )
-            if self.model != "limited-order" and np.any(counts != 1):
-                raise ValueError(
-                    "Explicit all-order and full-pupil models require one native frame"
-                )
-        if min(self.wavelength.value, self.pixel_scale.value) <= 0:
-            raise ValueError("Wavelength and pixel scale must be positive")
+        self.config.sampling_uncertainty_model._science_nodes(
+            float(self.exposures.value.max())
+        )
+        if self.wavelength.value <= 0:
+            raise ValueError("Wavelength must be positive")
 
 
 @dataclass(frozen=True, eq=False)
-class SamplingMetric(_PhysicalRecord):
-    """Mean, one-realization variance and relative coefficient for one metric.
+class UncertaintyMetricPrediction(_PhysicalRecord):
+    """Mean, variance and sampling uncertainty coefficient for one PSF metric.
 
-    The mean has one value per point for the first requested exposure.
-    The per-exposure mean, variance and coefficient have shape (exposure,
-    point). The per-exposure mean retains differences when exposure windows
-    select different Fourier grids.
+    The reference mean has one value per point. Variance and coefficient
+    have shape (exposure, point) and use the same mean for every exposure.
     """
 
     mean: u.Quantity
     variance: u.Quantity
     coefficient: u.Quantity
-    mean_by_exposure: u.Quantity
 
 
 @dataclass(frozen=True, eq=False)
-class SamplingResult:
-    """Sampling metrics and the grids used for the associated request."""
+class UncertaintyDiagnostics:
+    """Temporal quadrature grids and grid-specific means in exposure order.
 
-    request: SamplingRequest
-    metrics: Mapping[str, SamplingMetric]
+    Each grid contains the radial node count, angular node count and period
+    in seconds. Each metric's diagnostic mean has shape (exposure, point).
+    """
+
     grids: tuple[tuple[int, int, float], ...]
+    mean_by_exposure: Mapping[str, u.Quantity]
 
 
-def _prepare_sensing(configuration, wavelength, device, numerics=None):
-    physical = configuration.physical
-    telescope = physical.telescope
-    amplitude = configuration.pupil_amplitude
-    opd = configuration.static_opd.value
-    support = float(configuration.pupil_support.value)
-    diameter = float(telescope.diameter.to_value(u.m))
-    physical_side, sensor_side, modal_order = (
-        (64, 96, 11)
-        if numerics is None
-        else (numerics.physical_side, numerics.sensor_side, numerics.modal_order)
+@dataclass(frozen=True, eq=False)
+class UncertaintyPrediction:
+    """Predicted metric means, variances and uncertainty coefficients."""
+
+    request: UncertaintyRequest
+    metrics: Mapping[str, UncertaintyMetricPrediction]
+    diagnostics: UncertaintyDiagnostics | None = None
+
+
+def _sampling_frame_interval(config):
+    ho = _required(config.high_order_loop, "High-order loop", "frame_rate")
+    lo = _required(config.low_order_loop, "Low-order loop", "frame_rate")
+    high = float(ho.frame_interval.to_value(u.s))
+    low = float(lo.frame_interval.to_value(u.s))
+    if high != low:
+        raise ValueError(
+            "The sampling uncertainty model requires equal HO and LO loop rates"
+        )
+    return high
+
+
+def _project_sampling_configuration(config):
+    """Resolve the observing geometry used by the sampling calculations."""
+    atmosphere = _required(config.atmosphere, "Atmosphere", "reference_wavelength")
+    fried = atmosphere.fried_parameter
+    if atmosphere.seeing is not None:
+        fried = (
+            0.976 * atmosphere.reference_wavelength / atmosphere.seeing.to_value(u.rad)
+        )
+    if fried is None:
+        raise ValueError("Sampling requires Seeing or a Fried parameter")
+    _required(atmosphere, "Atmosphere", "layer_heights")
+    high_order = _required(config.high_order_sources, "Beacon geometry", "height")
+    angle = config.telescope.zenith_angle
+    airmass = 1.0 if angle is None else 1 / np.cos(angle.to_value(u.rad))
+    low_order = _required(config.low_order_sources, "Guide stars", "wavelengths")
+    return replace(
+        config,
+        atmosphere=replace(
+            atmosphere,
+            fried_parameter=fried * airmass ** (-3 / 5),
+            layer_heights=atmosphere.layer_heights * airmass,
+        ),
+        high_order_sources=replace(high_order, height=high_order.height * airmass),
+        low_order_sources=replace(
+            low_order, directions=u.Quantity([star.position for star in config.ngs])
+        ),
     )
-    pupil = make_pupil(
-        amplitude, opd, support, diameter, wavelength, physical_side, modal_order
+
+
+def _ngs_optics(config, side, modal_order, reference_side):
+    if config.pupil is None:
+        raise ValueError("NGS sensing requires a resolved pupil")
+    telescope = _required(config.telescope, "Telescope", "diameter")
+    low_order = _required(config.low_order_sources, "Guide stars", "wavelengths")
+    if len(low_order.wavelengths) != 1:
+        raise ValueError("Require one shared guide-star sensing wavelength")
+    detector = _required(
+        config.low_order_detector,
+        "Guide-star detector",
+        "pixel_scale",
+        "read_noise",
+        "threshold",
     )
-    ngs = physical.low_order_sources
-    sensing_wave = float(ngs.wavelengths.to_value(u.m)[0])
-    reference_wave = float(physical.atmosphere.reference_wavelength.to_value(u.m))
+    wave = float(low_order.wavelengths.to_value(u.m)[0])
+    amplitude = config.pupil.amplitude
     optical = optical_pupil(
         amplitude,
-        np.zeros_like(opd),
-        support,
-        diameter,
-        sensing_wave,
-        sensor_side,
+        np.zeros_like(amplitude),
+        float(config.pupil.span.to_value(u.m)),
+        float(telescope.diameter.to_value(u.m)),
+        wave,
+        side,
         modal_order,
+        reference_side=reference_side,
     )
-    pixel = sensing_wave / (optical.optical_size * optical.dx) * _MAS_PER_RADIAN
-    detector = physical.low_order_detector
+    pixel = wave / (optical.optical_size * optical.dx) * _MAS_PER_RADIAN
     pitch = float(detector.pixel_scale.to_value(u.mas / u.pix))
     if optical.optical_size * pixel / 2 < 2.5 * pitch + 70:
         raise ValueError(
             "Optical field does not cover the displaced five-pixel detector"
         )
+    return optical, pixel, pitch, wave
+
+
+def _ngs_photons_per_frame(config):
+    dt = _sampling_frame_interval(config)
+    return np.array([star.flux.to_value(u.photon / u.s) * dt for star in config.ngs])
+
+
+def gaussian_ngs_noise_covariance(
+    config: Configuration, *, ee: u.Quantity, fwhm: u.Quantity
+) -> u.Quantity:
+    """Calculate angular design noise for the configured NGSs.
+
+    Supply one encircled-energy fraction and angular FWHM per configured
+    star. The caller chooses the measurement conventions. The Gaussian
+    spot calculation uses each star's flux, the configured detector and
+    the diffraction centroid calibration. Returns a covariance in mas²,
+    with interleaved x/y axes in the configured star order.
+    """
+    fraction = _quantity(ee, u.one, "ee", 1).value
+    width = _quantity(fwhm, u.mas, "fwhm", 1).value
+    if not len(config.ngs) == len(fraction) == len(width):
+        raise ValueError("EE and FWHM must match the configured NGSs")
+    settings = config.sampling_uncertainty_model
+    optical, pixel, pitch, _ = _ngs_optics(
+        config,
+        settings.sensing_pupil_samples,
+        settings.zernike_radial_order,
+        settings.modal_pupil_samples,
+    )
+    conversion, _ = diffraction_calibration(optical, pixel, pitch)
+    detector = config.low_order_detector
+    noise = []
+    for photons, e, width_mas in zip(
+        _ngs_photons_per_frame(config), fraction, width, strict=True
+    ):
+        prior = centroid_noise_prior(
+            float(photons),
+            float(e),
+            float(width_mas),
+            pitch,
+            5,
+            float(detector.threshold.to_value(u.electron)),
+            float(detector.read_noise.to_value(u.electron)),
+        )
+        noise.append(conversion @ prior["covariance_pixel2"] @ conversion.T)
+    return block_diag(*noise) * u.mas**2
+
+
+def _prepare_sensing(
+    configuration,
+    wavelength,
+    device,
+    *,
+    ngs_noise_covariance=None,
+    grid_settings=None,
+    sensor_workers=1,
+):
+    settings = configuration.sampling_uncertainty_model
+    if grid_settings is None:
+        physical_side = reference_side = settings.modal_pupil_samples
+        modal_order = settings.zernike_radial_order
+        sensor_side = settings.sensing_pupil_samples
+        sensing_grid = (settings.sensing_radial_nodes, settings.sensing_angular_nodes)
+    else:
+        physical_side = grid_settings.physical_side
+        reference_side = grid_settings._reference_side
+        modal_order = grid_settings.modal_order
+        sensor_side = grid_settings.sensor_side
+        sensing_grid = grid_settings._sensing_grid
+    pupil = make_pupil(
+        configuration.pupil.amplitude,
+        configuration.pupil.static_opd.to_value(u.nm),
+        float(configuration.pupil.span.to_value(u.m)),
+        float(configuration.telescope.diameter.to_value(u.m)),
+        wavelength,
+        physical_side,
+        modal_order,
+    )
+    optical, pixel, pitch, sensing_wave = _ngs_optics(
+        configuration, sensor_side, modal_order, reference_side
+    )
+    reference_wave = float(configuration.atmosphere.reference_wavelength.to_value(u.m))
+    detector = configuration.low_order_detector
     propagation = None
     if device == "mps":
         from ._sensor_metal import MpsSensorPropagation
@@ -385,47 +373,24 @@ def _prepare_sensing(configuration, wavelength, device, numerics=None):
         optical, pixel, pitch, propagation=propagation
     )
 
-    directions = ngs.directions.to_value(u.rad)
-    photons = detector.photons_per_frame.to_value(u.photon)
-    ee = configuration.guide_star_ee.value
-    fwhm = configuration.guide_star_fwhm.value
-    angular = []
-    for count, fraction, width in zip(photons, ee, fwhm, strict=True):
-        prior = centroid_noise_prior(
-            float(count),
-            float(fraction),
-            float(width),
-            pitch,
-            5,
-            float(detector.threshold.to_value(u.electron)),
-            float(detector.read_noise.to_value(u.electron)),
-        )
-        angular.append(prior["covariance_pixel2"] * pitch**2)
+    directions = configuration.low_order_sources.directions.to_value(u.rad)
+    photons = _ngs_photons_per_frame(configuration)
     design = np.column_stack([pupil.coordinates, np.ones(len(pupil.coordinates))])
     coefficients = np.linalg.lstsq(design, pupil.basis[:2].T, rcond=None)[0]
     modal_to_angle = reference_wave / (2 * np.pi) * coefficients[:2] * _MAS_PER_RADIAN
     inverse_angle = np.linalg.inv(modal_to_angle)
-    prior = block_diag(
-        *(inverse_angle @ covariance @ inverse_angle.T for covariance in angular)
-    )
-    prior *= float(conversion[0, 0] / pitch) ** 2
+    prior = None
+    if ngs_noise_covariance is not None:
+        transform = np.kron(np.eye(len(directions)), inverse_angle)
+        prior = transform @ ngs_noise_covariance.to_value(u.mas**2) @ transform.T
     # The sensing grid uses unshifted polar rings. The science grid is staggered.
-    grid = (
-        (40, 48, 20.0, 0.01)
-        if numerics is None
-        else (
-            numerics.radial_order,
-            numerics.sensor_angular_order,
-            numerics.spectral_period_s,
-            numerics.spectral_interval_s,
-        )
-    )
     field = FieldCovariance(
-        physical,
+        configuration,
         pupil,
         wavelength * u.m,
-        *grid,
-        tilt_noise_prior=prior,
+        *sensing_grid,
+        period=None,
+        common_only=True,
     )
     gains, innovations, responses = [], [], []
     for count, theta in zip(photons, directions, strict=True):
@@ -436,7 +401,7 @@ def _prepare_sensing(configuration, wavelength, device, numerics=None):
                 optical,
                 covariance,
                 modes,
-                derivative_workers=1 if numerics is None else numerics.sensor_workers,
+                derivative_workers=sensor_workers,
             )
         else:
             image, derivatives = propagation.calculate(covariance, modes)
@@ -448,8 +413,8 @@ def _prepare_sensing(configuration, wavelength, device, numerics=None):
             count,
             conversion,
             len(directions),
-            read_noise_e=float(configuration.runtime_read_noise.value),
-            threshold_e=float(configuration.runtime_threshold.value),
+            read_noise_e=float(detector.read_noise.value),
+            threshold_e=float(detector.threshold.value),
         )
         gains.append(inverse_angle @ gain @ np.linalg.inv(inverse_angle))
         innovations.append(inverse_angle @ innovation @ inverse_angle.T)
@@ -465,53 +430,76 @@ def _prepare_sensing(configuration, wavelength, device, numerics=None):
 class _PreparedGrid:
     """Own the fixed AO grid and the reference wavelength's noise lags."""
 
-    def __init__(self, configuration, request, exposures, grid, sensing, *, compact):
+    def __init__(
+        self,
+        configuration,
+        wavelength,
+        exposures,
+        grid,
+        sensing,
+        *,
+        compact=False,
+        grid_settings=None,
+        instantaneous=False,
+    ):
         self.configuration = configuration
-        self.pupil = configuration.pupil_amplitude
+        self.pupil = configuration.pupil.amplitude
         self.physical, self.sensing = sensing
         self.radial_order, angular, period = grid
         self.grids = ((period, angular),)
-        self.numerics = request.numerics
-        self.instantaneous = request.model == "full-pupil"
-        self.angular_offset = (
-            0.5 if self.numerics is None else self.numerics.angular_offset
-        )
-        self.dt = float(configuration.frame_interval.value)
+        self.instantaneous = instantaneous
+        if grid_settings is None:
+            settings = configuration.sampling_uncertainty_model
+            self.science_side = settings.science_pupil_samples
+            self.modal_order = settings.zernike_radial_order
+            self.reference_side = settings.modal_pupil_samples
+            self.angular_offset = _SCIENCE_ANGULAR_OFFSET
+            self.spectral_interval = None
+        else:
+            self.science_side = grid_settings.optical_side
+            self.modal_order = grid_settings.modal_order
+            self.reference_side = grid_settings._reference_side
+            self.angular_offset = grid_settings.angular_offset
+            self.spectral_interval = grid_settings.spectral_interval_s
+        self.dt = _sampling_frame_interval(configuration)
         self.windows = {}
         for time in exposures:
             frames = round(time / self.dt)
             window = 1 - np.arange(frames) / frames
             window[0] = 0.5
             self.windows[time] = window
-        self.max_count = max(map(len, self.windows.values()))
+        self.max_count = max(map(len, self.windows.values()), default=1)
         self.compact = compact
         self._context = None
         self._noise_lags = None
-        self._set_optics(
-            float(request.wavelength.value), float(request.pixel_scale.value)
+        self._set_optics(wavelength)
+
+    def _set_optics(self, wave):
+        config = self.configuration
+        support = float(config.pupil.span.to_value(u.m))
+        diameter = float(config.telescope.diameter.to_value(u.m))
+        self.optical = optical_pupil(
+            self.pupil,
+            config.pupil.static_opd.value,
+            support,
+            diameter,
+            wave,
+            self.science_side,
+            self.modal_order,
+            reference_side=self.reference_side,
         )
 
-    def _set_optics(self, wave, pixel):
-        config = self.configuration
-        support = float(config.pupil_support.value)
         self.metadata = {
             "support_m": support,
             "wavelength_m": wave,
-            "pixel_scale_mas": pixel,
+            "pixel_scale_mas": wave
+            / (self.optical.optical_size * self.optical.dx)
+            * _MAS_PER_RADIAN,
         }
-        diameter = float(config.physical.telescope.diameter.to_value(u.m))
-        side, order = (
-            (64, 11)
-            if self.numerics is None
-            else (self.numerics.optical_side, self.numerics.modal_order)
-        )
-        self.optical = optical_pupil(
-            self.pupil, config.static_opd.value, support, diameter, wave, side, order
-        )
 
-    def at_science_optics(self, wave, pixel):
+    def at_science_optics(self, wave):
         view = copy(self)
-        view._set_optics(wave, pixel)
+        view._set_optics(wave)
         if self._context is not None:
             ratio = self.metadata["wavelength_m"] / wave
             view._context = self._context.at_wavelength(wave * u.m)
@@ -523,7 +511,7 @@ class _PreparedGrid:
             raise ValueError("Fourier grid does not match the prepared request")
         if self._context is None:
             prior, gains, innovations, responses = self.sensing
-            config = self.configuration.physical
+            config = self.configuration
             wave = self.metadata["wavelength_m"]
             context = FieldCovariance(
                 config,
@@ -532,7 +520,7 @@ class _PreparedGrid:
                 self.radial_order,
                 angular,
                 period,
-                0.01 if self.numerics is None else self.numerics.spectral_interval_s,
+                self.spectral_interval,
                 instantaneous=self.instantaneous,
                 tilt_noise_prior=prior,
                 sensing_gains=gains,
@@ -570,9 +558,24 @@ class _PreparedGrid:
         lags[:, :2, :2] += self._noise_lags
         return lags
 
+    def modal_phase_lags(self, position, zero_lag, count, terms, *, remove_tilt):
+        """Return native-frame modal covariance using the restored zero lag."""
+        lags = zero_lag[None]
+        if count > 1:
+            lags = self.point_lags(position, terms=terms)[:count]
+            if not np.allclose(lags[0], zero_lag, rtol=1e-8, atol=1e-11):
+                raise ValueError(
+                    "Temporal and restored modal covariance disagree at zero lag"
+                )
+            lags[0] = zero_lag
+        if remove_tilt:
+            lags[:, :2, :] = 0
+            lags[:, :, :2] = 0
+        return lags
 
-class SamplingPredictor:
-    """Predict sampling error using CPU or Metal with bounded field batches.
+
+class SamplingUncertaintyModel:
+    """Predict finite-exposure sampling uncertainty on CPU or Metal.
 
     CPU calculations use float64. Metal uses float32 for its documented
     contractions and CPU float64 for preparation and fallback. An explicit
@@ -585,7 +588,6 @@ class SamplingPredictor:
         *,
         device: str = "cpu",
         batch_size: int = 4,
-        pipeline: bool = True,
         dtype=None,
     ):
         if device not in {"cpu", "mps"}:
@@ -598,154 +600,59 @@ class SamplingPredictor:
         self.device = device
         self.dtype = expected_dtype
         self.batch_size = batch_size
-        self.pipeline = pipeline
         self._sensing_key = None
         self._sensing = None
         self._grid_key = None
         self._prepared = None
 
     def predict_many(
-        self, requests: Iterable[SamplingRequest]
-    ) -> Iterator[SamplingResult]:
+        self, requests: Iterable[UncertaintyRequest], *, diagnostics: bool = False
+    ) -> Iterator[UncertaintyPrediction]:
         """Yield predictions in the caller's request, point and exposure order.
 
         Requests sharing a configuration can use the same sensing and residual
-        covariance. Balanced and Full share a Sobol importance distribution
-        when configuration, wavelength, pixel scale, point and grid match.
+        covariance. Request diagnostics to retain the temporal quadrature
+        grids and their metric means.
         """
         requests = tuple(requests)
         configurations = defaultdict(list)
         results = {}
         for index, request in enumerate(requests):
-            if not isinstance(request, SamplingRequest):
-                raise TypeError("request must be a SamplingRequest")
-            if request.numerics is None:
-                configurations[request.configuration].append(index)
-            else:
-                results[index] = self._predict_explicit(request)
+            if not isinstance(request, UncertaintyRequest):
+                raise TypeError("request must be an UncertaintyRequest")
+            configurations[request.config, _noise_key(request)].append(index)
         for indices in configurations.values():
             group = [requests[index] for index in indices]
-            predictions = self._predict_standard(group)
+            predictions = self._predict_standard(group, diagnostics=diagnostics)
             results.update(zip(indices, predictions, strict=True))
         yield from (results[index] for index in range(len(requests)))
 
-    def predict(self, request: SamplingRequest) -> SamplingResult:
-        """Evaluate one request using the prepared detector and Fourier grid."""
-        return next(self.predict_many((request,)))
+    def predict(
+        self, request: UncertaintyRequest, *, diagnostics: bool = False
+    ) -> UncertaintyPrediction:
+        """Evaluate one request, optionally retaining grid diagnostics."""
+        return next(self.predict_many((request,), diagnostics=diagnostics))
 
-    def predict_fast_means(self, request: SamplingRequest) -> Mapping[str, u.Quantity]:
-        """Evaluate the restored Fast metric means without temporal contractions.
-
-        A single exposure selects the same Fourier grid as a Fast prediction.
-        The returned unit-aware arrays follow the requested point order.
-        """
-        if not isinstance(request, SamplingRequest):
-            raise TypeError("request must be a SamplingRequest")
-        if request.model != "fast" or len(request.exposures) != 1:
-            raise ValueError("Mean prediction requires one exposure on the Fast model")
-        duration = float(request.exposures.value[0])
-        device = fast_grid_device(self.device, duration)
-        prepared, engine, optics = self._prepare_grid(
-            request,
-            device,
-            science_grid(duration),
-            (duration,),
-            compact=duration > MAX_MPS_EXPOSURE,
+    def _predict_standard(self, requests, *, diagnostics):
+        config = requests[0].config
+        frame_interval = _sampling_frame_interval(config)
+        atmosphere = _required(config.atmosphere, "Atmosphere", "wind_speeds")
+        wind_speeds = atmosphere.wind_speeds.to_value(u.m / u.s)
+        moving = wind_speeds[wind_speeds > 0]
+        diameter = config.telescope.diameter.to_value(u.m)
+        minimum_period_frames = (
+            ceil(4 * (diameter / moving.min()) / frame_interval) if moving.size else 0
         )
-        points = [tuple(point) for point in request.positions.value]
-        if device == "mps":
-            backend = engine.backend
-            response_bytes = 8 * backend.nmodes * len(backend.spatial)
-            size = min(self.batch_size, max(1, _LAG_BATCH_BYTES // response_bytes))
-            scale = prepared.metadata["wavelength_m"] / request.wavelength.value
-            means = np.array(
-                [
-                    mean
-                    for start in range(0, len(points), size)
-                    for mean in engine.means(
-                        points[start : start + size], optics, phase_scale=scale
-                    )
-                ]
-            )
-        else:
-            means = np.array(
-                [
-                    optics.metric_response(
-                        optics.science.tiled_phase_structures([xy])[0][0],
-                        means_only=True,
-                    )[0]
-                    for xy in points
-                ]
-            )
-        return MappingProxyType(
-            {
-                name: _quantity(means[:, i] * unit, unit, name, 1)
-                for i, (name, unit) in enumerate(_METRIC_UNITS.items())
-            }
+        science_grid = partial(
+            config.sampling_uncertainty_model._science_grid,
+            frame_interval=frame_interval,
+            minimum_period_frames=minimum_period_frames,
         )
-
-    def _predict_explicit(self, request):
-        numerics = request.numerics
-        radial = (
-            numerics.full_radial_order
-            if request.model == "full-pupil"
-            else numerics.radial_order
-        )
-        grid = (radial, numerics.angular_order, numerics.spectral_period_s)
-        windows = tuple(dict.fromkeys(map(float, request.exposures.value)))
-        if self.device == "mps" and (
-            numerics.restore_mean or request.model != "limited-order"
-        ):
-            raise ValueError(
-                "Explicit grids with restored science coherence require CPU"
-            )
-        _prepared, engine, optics = self._prepare_grid(
-            request, self.device, grid, windows, compact=False
-        )
-        points = list(map(tuple, request.positions.value))
-        unique = tuple(dict.fromkeys(points))
-        if engine is None:
-            points_by_id = {xy: optics.point(xy) for xy in unique}
-        else:
-            points_by_id = {}
-            for start in range(0, len(unique), self.batch_size):
-                batch = unique[start : start + self.batch_size]
-                lags = engine.point_lags(np.asarray(batch) * ARCSEC)
-                responses = [
-                    optics.modal_response(value) for value in engine.covariances(lags)
-                ]
-                estimates = engine.integrate(lags, responses)
-                points_by_id.update(
-                    (
-                        xy,
-                        (
-                            response[0],
-                            {exposure: values[i] for exposure, values in estimates},
-                        ),
-                    )
-                    for i, (xy, response) in enumerate(
-                        zip(batch, responses, strict=True)
-                    )
-                )
-        shape = (len(request.exposures), len(points), len(_METRIC_UNITS))
-        means = np.empty(shape)
-        means[:] = [points_by_id[xy][0] for xy in points]
-        integrated = np.array(
-            [
-                [points_by_id[xy][1][float(exposure)] for xy in points]
-                for exposure in request.exposures.value
-            ]
-        )
-        return self._result(
-            request, (grid,) * len(request.exposures), means, integrated
-        )
-
-    def _predict_standard(self, requests):
-        all_fast = all(request.model == "fast" for request in requests)
+        all_fast = all(request.model_type == "fast" for request in requests)
         dense_long_grids = {
             (_science_band(request), science_grid(exposure))
             for request in requests
-            if request.model != "fast"
+            if request.model_type != "fast"
             for exposure in request.exposures.value
             if exposure > MAX_MPS_EXPOSURE
         }
@@ -757,21 +664,23 @@ class SamplingPredictor:
         for index, request in enumerate(requests):
             grids = tuple(map(science_grid, request.exposures.value))
             shape = (len(grids), len(request.positions), len(_METRIC_UNITS))
-            buffers.append((grids, np.empty(shape), np.empty(shape)))
+            buffers.append(
+                (np.empty(shape), (grids, np.empty(shape)) if diagnostics else None)
+            )
             band = _science_band(request)
             representatives.setdefault(band, request)
             for exposure_index, grid in enumerate(grids):
                 exposure = float(request.exposures.value[exposure_index])
                 compact_fast = (
-                    request.model == "fast"
+                    request.model_type == "fast"
                     and exposure > MAX_MPS_EXPOSURE
                     and (band, grid) not in dense_long_grids
                 )
                 accelerated = compact_fast or (all_fast and self.device == "mps")
                 # Metal Fast and the largest CPU Fast grid reuse phase lags across bands.
-                key = grid, accelerated, band[2] if accelerated else band
+                key = grid, accelerated, band[1] if accelerated else band
                 for point_index, xy in enumerate(map(tuple, request.positions.value)):
-                    jobs[key][band][xy][request.model, exposure].append(
+                    jobs[key][band][xy][request.model_type, exposure].append(
                         (index, exposure_index, point_index)
                     )
 
@@ -787,10 +696,17 @@ class SamplingPredictor:
                     grid,
                     windows,
                     compact=False,
-                    covariance_device=fast_grid_device(self.device, windows[-1]),
                 )
                 batches = (
-                    (prepared, self._dense_points(band, bands[band], optics, prepared)),
+                    (
+                        prepared,
+                        self._dense_points(
+                            band,
+                            bands[band],
+                            optics,
+                            _covariance_device(self.device, windows[-1]),
+                        ),
+                    ),
                 )
 
             for prepared, points in batches:
@@ -800,43 +716,121 @@ class SamplingPredictor:
                             model, lags[model], prepared.windows[duration], prepared.dt
                         )
                         for index, exposure_index, point_index in indices:
-                            _, field_means, field_integrated = buffers[index]
-                            field_means[exposure_index, point_index] = means
+                            field_integrated, detail = buffers[index]
                             field_integrated[exposure_index, point_index] = integrated
+                            if detail is not None:
+                                detail[1][exposure_index, point_index] = means
+        reference = self._reference_means(requests)
         return [
-            self._result(request, *buffer)
+            self._result(request, reference[_science_band(request)], *buffer)
             for request, buffer in zip(requests, buffers, strict=True)
         ]
 
+    def _reference_means(self, requests):
+        """Compute the zero-lag mean once per science band and field point."""
+        bands = defaultdict(dict)
+        for request in requests:
+            points = bands[_science_band(request)]
+            for position in map(tuple, request.positions.value):
+                points.setdefault(position, request)
+
+        first = requests[0]
+        config, sensing = self._prepare_detector(first, self.device)
+        settings = config.sampling_uncertainty_model
+        grid = (
+            settings.science_min_radial_nodes,
+            settings.science_min_angular_nodes,
+            None,
+        )
+        prepared = _PreparedGrid(
+            config,
+            float(first.wavelength.value),
+            (),
+            grid,
+            sensing,
+            instantaneous=True,
+            compact=True,
+        )
+        means = {}
+        for band, points in bands.items():
+            wave, _ = band
+            view = (
+                prepared
+                if wave == first.wavelength.value
+                else prepared.at_science_optics(wave)
+            )
+            optics = self._optics(view, next(iter(points.values())))
+            means[band] = {
+                position: optics.mean_metrics(position) for position in points
+            }
+        return means
+
     @staticmethod
-    def _dense_points(band, points, optics, prepared):
+    def _dense_points(band, points, optics, covariance_device):
+        prepared = optics.predictor
         for xy, users in points.items():
-            counts = defaultdict(list)
+            frame_counts = defaultdict(list)
             for model, duration in users:
-                counts[model].append(len(prepared.windows[duration]))
-            means, lags = optics.point(
-                xy, {model: tuple(frames) for model, frames in counts.items()}
+                frame_counts[model].append(len(prepared.windows[duration]))
+            indices = metric_lag_indices(frame_counts)
+            structure, modal_zero_lag = optics.restore_phase(xy)
+            means, kernels, coherence = optics.metric_response(structure)
+
+            terms = None
+            if any(lags[-1] > 0 for lags in indices.values()):
+                terms = optics.science.context.direction_terms(np.asarray(xy) * ARCSEC)
+            modal_frames = max(
+                (
+                    indices[model][-1] + 1
+                    for model in ("fast", "balanced")
+                    if model in indices
+                ),
+                default=1,
+            )
+            modal_lags = prepared.modal_phase_lags(
+                xy,
+                modal_zero_lag,
+                modal_frames,
+                terms,
+                remove_tilt=optics.tilt is not None,
+            )
+            pupil_lags = (
+                optics.pupil_phase_lags(structure, terms, indices["full"])
+                if "full" in indices
+                else None
+            )
+            lags = predict_metric_lags(
+                indices,
+                modal_lags,
+                pupil_lags,
+                optics.pupil.basis,
+                kernels,
+                coherence,
+                device=covariance_device,
             )
             yield band, xy, means, lags
 
     @staticmethod
-    def _result(request, grids, means, integrated):
+    def _result(request, reference, integrated, detail):
+        means = np.array(
+            [reference[position] for position in map(tuple, request.positions.value)]
+        )
         if (
             np.any(means <= 0)
             or np.any(integrated < 0)
-            or not np.isfinite(means + integrated).all()
+            or not np.isfinite(means).all()
+            or not np.isfinite(integrated).all()
         ):
             raise ValueError("Invalid predicted metric covariance or mean")
 
         def quantities(index, unit):
-            axes = means[..., index]
+            mean = means[:, index]
             variance = integrated[..., index] / request.exposures.value[:, None]
-            relative = np.sqrt(integrated[..., index]) / axes
-            return SamplingMetric(
-                _quantity(axes[0] * unit, unit, "mean", 1),
+            relative = np.sqrt(integrated[..., index]) / mean
+            return UncertaintyMetricPrediction(
+                _quantity(mean * unit, unit, "mean", 1),
                 _quantity(variance * unit**2, unit**2, "variance", 2),
                 _quantity(relative * u.s**0.5, u.s**0.5, "coefficient", 2),
-                _quantity(axes * unit, unit, "mean_by_exposure", 2),
             )
 
         metrics = MappingProxyType(
@@ -845,21 +839,43 @@ class SamplingPredictor:
                 for i, (name, unit) in enumerate(_METRIC_UNITS.items())
             }
         )
-        return SamplingResult(request, metrics, grids)
+        diagnostics = None
+        if detail is not None:
+            grids, grid_means = detail
+            diagnostics = UncertaintyDiagnostics(
+                grids,
+                MappingProxyType(
+                    {
+                        name: _quantity(
+                            grid_means[..., i] * unit, unit, "mean_by_exposure", 2
+                        )
+                        for i, (name, unit) in enumerate(_METRIC_UNITS.items())
+                    }
+                ),
+            )
+        return UncertaintyPrediction(request, metrics, diagnostics)
 
-    def _prepare_grid(
-        self, request, device, grid, windows, *, compact, covariance_device="cpu"
-    ):
-        configuration = request.configuration
-        sensing_key = (configuration, device, request.numerics)
+    def _prepare_detector(self, request, device):
+        configuration = request.config
+        sensing_key = (configuration, device, _noise_key(request))
         if self._sensing_key != sensing_key:
             self._prepared = self._grid_key = None
-            self._sensing = _prepare_sensing(
-                configuration, float(request.wavelength.value), device, request.numerics
+            projected = _project_sampling_configuration(configuration)
+            sensing = _prepare_sensing(
+                projected,
+                float(request.wavelength.value),
+                device,
+                ngs_noise_covariance=request.ngs_noise_covariance,
             )
+            self._sensing = projected, sensing
             self._sensing_key = sensing_key
-        explicit_model = request.model if request.numerics is not None else None
-        key = (sensing_key, grid, windows, compact, covariance_device, explicit_model)
+        return self._sensing
+
+    def _prepare_grid(self, request, device, grid, windows, *, compact):
+        projected, sensing = self._prepare_detector(request, device)
+        wavelength = float(request.wavelength.value)
+        sensing_key = self._sensing_key
+        key = (sensing_key, grid, windows, compact)
         if key != self._grid_key:
             self._prepared = self._grid_key = None
             if device == "mps":
@@ -867,55 +883,31 @@ class SamplingPredictor:
 
                 torch.mps.empty_cache()
             prepared = _PreparedGrid(
-                configuration, request, windows, grid, self._sensing, compact=compact
+                projected, wavelength, windows, grid, sensing, compact=compact
             )
-            optics = self._optics(prepared, request, covariance_device)
-            engine = self._engine(request, device, compact, prepared, optics)
+            optics = self._optics(prepared, request)
+            engine = self._engine(device, compact, prepared, optics)
             band = _science_band(request)
             self._prepared = (prepared, engine, band, optics)
             self._grid_key = key
         prepared, engine, band, optics = self._prepared
-        wave, pixel, tilt = _science_band(request)
-        if (wave, pixel, tilt) != band:
-            view = prepared.at_science_optics(wave, pixel)
-            optics = self._optics(view, request, covariance_device)
-            if explicit_model is not None:
-                return (
-                    view,
-                    self._engine(request, device, compact, view, optics),
-                    optics,
-                )
+        wave, tilt = _science_band(request)
+        if (wave, tilt) != band:
+            view = prepared.at_science_optics(wave)
+            optics = self._optics(view, request)
         return prepared, engine, optics
 
     @staticmethod
-    def _optics(prepared, request, covariance_device):
-        if request.numerics is not None:
-            return ExplicitScienceOptics(prepared, request.numerics, request.model)
+    def _optics(prepared, request):
         return CompactScienceOptics(
             prepared,
-            remove_science_tilt=request.remove_science_tilt,
-            covariance_device=covariance_device,
+            remove_science_tilt=_remove_science_tilt(request.model_settings),
         )
 
     @staticmethod
-    def _engine(request, device, compact, prepared, optics):
+    def _engine(device, compact, prepared, optics):
         if device == "cpu":
             return CPUCompactFastBatch(optics) if compact else None
-        if request.numerics is not None:
-            from ._tensor_batch import TensorBatch
-
-            context = prepared.context(*prepared.grids[0])
-            windows = [
-                (time, len(window), window) for time, window in prepared.windows.items()
-            ]
-            return TensorBatch(
-                context,
-                prepared.dt,
-                prepared.max_count,
-                prepared._noise_lags,
-                windows,
-                device,
-            )
         from ._fast_metal import MPSFastBatch
 
         return MPSFastBatch(optics.science, prepared)
@@ -931,7 +923,7 @@ class SamplingPredictor:
                 windows,
                 chunk,
                 representatives,
-                fast_grid_device(self.device, duration),
+                _covariance_device(self.device, duration),
                 compact=duration > MAX_MPS_EXPOSURE,
             )
 
@@ -956,27 +948,35 @@ class SamplingPredictor:
                 max(1, _LAG_BATCH_BYTES // max(lag_bytes, response_bytes)),
             )
             pipeline = (
-                self.pipeline
-                and len(positions) > size
-                and size * 2 * lag_bytes <= _LAG_BATCH_BYTES
+                len(positions) > size and size * 2 * lag_bytes <= _LAG_BATCH_BYTES
             )
         batches = [positions[i : i + size] for i in range(0, len(positions), size)]
         results = (
             (band, xy, means, {"fast": lags})
             for rows, _, _ in engine.evaluate_many(
-                batches, optics, users, remove_tilt=band[2], pipeline=pipeline
+                batches, optics, users, remove_tilt=band[1], pipeline=pipeline
             )
             for band, xy, means, lags in rows
         )
         return prepared, results
 
 
+def _covariance_device(device, exposure):
+    """Keep the largest Fast grid on the bounded CPU path."""
+    return "cpu" if exposure > MAX_MPS_EXPOSURE else device
+
+
+def _noise_key(request):
+    noise = request.ngs_noise_covariance
+    return None if noise is None else noise.value.tobytes()
+
+
+def _remove_science_tilt(settings):
+    return isinstance(settings, FastSettings) and settings.remove_science_tilt
+
+
 def _science_band(request):
-    return (
-        float(request.wavelength.value),
-        float(request.pixel_scale.value),
-        request.remove_science_tilt,
-    )
+    return float(request.wavelength.value), _remove_science_tilt(request.model_settings)
 
 
 def _band_windows(bands):

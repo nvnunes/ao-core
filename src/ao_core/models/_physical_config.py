@@ -1,15 +1,26 @@
 """Unit-aware physical inputs and their existing AO INI field names."""
 
 from ast import literal_eval
+from collections.abc import Iterable
 from configparser import ConfigParser
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from numbers import Integral, Real
 from pathlib import Path
 
 import numpy as np
 from astropy import units as u
+from astropy.io import fits
+from scipy.ndimage import rotate, zoom
 
-from ._ini import polar_to_cartesian, read_ini, read_ini_array, read_ini_scalar
+from ._ini import (
+    polar_to_cartesian,
+    read_ini,
+    read_ini_array,
+    read_ini_scalar,
+    resolve_ini_path,
+)
+from ._sampling_grid import SamplingSettings
+from ._units import _PhysicalRecord, _quantity
 
 
 def _quantities(record, **fields):
@@ -282,12 +293,82 @@ class LoopConfig:
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
-class AOConfiguration:
-    """Unit-aware physical inputs grouped by optical or control component.
+class Pupil(_PhysicalRecord):
+    """Resolved pupil amplitude, spatial sampling, and static optical path.
 
-    Construct the records directly from quantities or use `from_ini` with the
-    existing AO sections. Absent groups and fields are None. Model consumers
-    supply their own defaults and check which inputs they require.
+    Attributes:
+        amplitude: Dimensionless field amplitude on a real, nonnegative square grid.
+        pitch: Physical distance between adjacent sample centers.
+        static_opd: Optical path difference on the same grid, stored in nm.
+            Defaults to a zero map.
+    """
+
+    amplitude: np.ndarray
+    pitch: u.Quantity
+    static_opd: u.Quantity | None = None
+
+    def __post_init__(self):
+        amplitude = np.asarray(self.amplitude)
+        if (
+            amplitude.ndim != 2
+            or amplitude.shape[0] != amplitude.shape[1]
+            or amplitude.shape[0] < 3
+            or amplitude.dtype.kind not in "bfiu"
+            or not np.isfinite(amplitude).all()
+            or np.any(amplitude < 0)
+            or not np.any(amplitude > 0)
+        ):
+            raise ValueError("Require a finite nonnegative square pupil with light")
+        amplitude = np.asarray(amplitude, dtype=np.float64)
+        owned = np.frombuffer(amplitude.tobytes(), dtype=np.float64)
+        object.__setattr__(self, "amplitude", owned.reshape(amplitude.shape))
+        object.__setattr__(self, "pitch", _quantity(self.pitch, u.m, "pitch", 0))
+        _positive(self, "pitch")
+        opd = self.static_opd
+        if opd is None:
+            opd = np.zeros(amplitude.shape) * u.nm
+        opd = _quantity(opd, u.nm, "static_opd", 2)
+        if opd.shape != amplitude.shape:
+            raise ValueError("static_opd must have the pupil amplitude shape")
+        object.__setattr__(self, "static_opd", opd)
+
+    @property
+    def span(self) -> u.Quantity:
+        """Distance between the first and last sample centers along a side."""
+        return (self.amplitude.shape[0] - 1) * self.pitch
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class NaturalGuideStar(_PhysicalRecord):
+    """One low-order guide star in the AO configuration.
+
+    Attributes:
+        position: Cartesian (x, y) angular offsets in the shared field frame.
+        flux: Positive effective incident photon rate at the NGS sensor.
+    """
+
+    position: u.Quantity
+    flux: u.Quantity
+
+    def __post_init__(self):
+        position = _quantity(self.position, u.arcsec, "position", 1)
+        if position.shape != (2,):
+            raise ValueError("position must contain one angular [x, y] pair")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(
+            self, "flux", _quantity(self.flux, u.photon / u.s, "flux", 0)
+        )
+        _positive(self, "flux")
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class Configuration:
+    """Shared AO system values and values supplied for a calculation.
+
+    The optical and control records are optional until a model needs them.
+    Use an existing AO INI or construct the same records in memory. Supply
+    resolved pupil data and the ordered NGS list as needed. The sampling
+    uncertainty settings are shared by Fast, Balanced and Full.
     """
 
     telescope: TelescopeConfig | None = None
@@ -301,42 +382,141 @@ class AOConfiguration:
     science_detector: DetectorConfig | None = None
     high_order_loop: LoopConfig | None = None
     low_order_loop: LoopConfig | None = None
+    pupil: Pupil | None = None
+    ngs: tuple[NaturalGuideStar, ...] = ()
+    sampling_uncertainty_model: SamplingSettings = field(default_factory=SamplingSettings)
+
+    def __post_init__(self):
+        if self.pupil is not None and not isinstance(self.pupil, Pupil):
+            raise TypeError("pupil must be a Pupil")
+        ngs = tuple(self.ngs)
+        if not all(isinstance(star, NaturalGuideStar) for star in ngs):
+            raise TypeError("ngs must contain NaturalGuideStar records")
+        object.__setattr__(self, "ngs", ngs)
+        if not isinstance(self.sampling_uncertainty_model, SamplingSettings):
+            raise TypeError("sampling_uncertainty_model must be SamplingSettings")
 
     @classmethod
-    def from_ini(cls, ini: ConfigParser) -> "AOConfiguration":
-        """Decode the shared physical values from an already parsed AO INI.
+    def from_ini(
+        cls, ini_parser: ConfigParser, *, ini_path: str | Path | None = None
+    ) -> "Configuration":
+        """Decode shared sections and sampling settings from a parsed INI.
 
-        Use the case-sensitive parser returned by `read_ini` or `parse_ini`.
-        The fields use their existing numerical INI conventions. Omitted
-        fields are left unspecified. Atmospheric and beacon geometry retain
-        the values in the file, with no zenith-angle projection applied.
-        Application sections and format-specific file paths remain available
-        in the original parser for the caller.
+        Pass the INI path returned by read_ini for relative telescope map
+        paths. File-backed pupils use the configured diameter and resolution
+        to determine pixel pitch. Atmospheric and beacon inputs retain their
+        supplied geometry. Complete the NGS data with with_updates().
         """
-        telescope = _read_telescope(ini)
+        telescope = _read_telescope(ini_parser)
         return cls(
             telescope=telescope,
-            atmosphere=_read_atmosphere(ini),
-            high_order_sources=_read_sources(ini, "sources_HO"),
-            low_order_sources=_read_sources(ini, "sources_LO"),
-            science_sources=_read_sources(ini, "sources_science"),
-            fitting=_read_fitting(ini),
-            high_order_lenslets=_read_lenslets(ini, telescope),
-            low_order_detector=_read_low_order_detector(ini),
-            science_detector=_read_science_detector(ini),
-            high_order_loop=_read_loop(ini, "HO"),
-            low_order_loop=_read_loop(ini, "LO"),
+            atmosphere=_read_atmosphere(ini_parser),
+            high_order_sources=_read_sources(ini_parser, "sources_HO"),
+            low_order_sources=_read_sources(ini_parser, "sources_LO"),
+            science_sources=_read_sources(ini_parser, "sources_science"),
+            fitting=_read_fitting(ini_parser),
+            high_order_lenslets=_read_lenslets(ini_parser, telescope),
+            low_order_detector=_read_low_order_detector(ini_parser),
+            science_detector=_read_science_detector(ini_parser),
+            high_order_loop=_read_loop(ini_parser, "HO"),
+            low_order_loop=_read_loop(ini_parser, "LO"),
+            pupil=_read_pupil(ini_parser, ini_path, telescope),
+            sampling_uncertainty_model=SamplingSettings._from_ini(ini_parser),
+        )
+
+    def with_updates(
+        self,
+        *,
+        ngs: Iterable[NaturalGuideStar] | None = None,
+        zenith_angle: u.Quantity | None = None,
+        pupil: Pupil | None = None,
+    ) -> "Configuration":
+        """Return a validated configuration with the supplied calculation inputs.
+
+        Omitted inputs and None retain their values. An empty NGS sequence
+        clears the guide-star collection.
+        """
+        telescope = self.telescope
+        if zenith_angle is not None:
+            telescope = replace(
+                telescope or TelescopeConfig(), zenith_angle=zenith_angle
+            )
+        return replace(
+            self,
+            telescope=telescope,
+            ngs=self.ngs if ngs is None else tuple(ngs),
+            pupil=self.pupil if pupil is None else pupil,
         )
 
 
-def load_ao_configuration(path: str | Path) -> AOConfiguration:
-    """Read physical inputs from an existing AO INI file.
+def load_ao_configuration(path: str | Path) -> Configuration:
+    """Read a shared AO configuration and resolve its telescope map paths."""
+    ini_path, ini_parser = read_ini(path)
+    return Configuration.from_ini(ini_parser, ini_path=ini_path)
 
-    If the caller also needs application fields or native pass-through
-    values, use `read_ini` once and pass that parser to `AOConfiguration.from_ini`.
-    """
-    _, ini = read_ini(path)
-    return AOConfiguration.from_ini(ini)
+
+def _telescope_map_path(section, key, ini_path):
+    value = section.get(key, "").strip()
+    if value.startswith(("'", '"')) and value.endswith(value[0]):
+        value = value[1:-1].strip()
+    if not value:
+        return None
+    if ini_path is not None:
+        return resolve_ini_path(
+            value,
+            source=Path(ini_path).expanduser().resolve(),
+            label=f"telescope.{key}",
+        )
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"ini_path is required for relative telescope.{key}")
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found for telescope.{key}: {path}")
+    return path
+
+
+def _read_pupil(ini_parser, ini_path, telescope):
+    if not ini_parser.has_section("telescope"):
+        return None
+    section = ini_parser["telescope"]
+    pupil_path, apodizer_path, opd_path = (
+        _telescope_map_path(section, key, ini_path)
+        for key in ("PathPupil", "PathApodizer", "PathStaticOn")
+    )
+    has_maps = any((pupil_path, apodizer_path, opd_path))
+    if telescope is None or telescope.diameter is None:
+        if has_maps:
+            raise ValueError("TelescopeDiameter is required to resolve pupil sampling")
+        return None
+    if telescope.pupil_resolution is None and not has_maps:
+        return None
+    side = telescope.pupil_resolution or 256
+    pitch = telescope.diameter / side
+    angle = section.getfloat("PupilAngle", fallback=0.0)
+
+    def load_map(path):
+        data = np.array(fits.getdata(path), dtype=np.float64)
+        if data.ndim != 2 or min(data.shape) < 2 or np.isinf(data).any():
+            raise ValueError(f"Expected a finite two-dimensional telescope map: {path}")
+        data[np.isnan(data)] = 0
+        if angle:
+            data = rotate(data, angle, reshape=False)
+        if data.shape != (side, side):
+            data = zoom(data, [side / length for length in data.shape], order=1)
+        return data
+
+    if pupil_path is None:
+        xy = (np.arange(side) - (side - 1) / 2) * (2.0 / side)
+        radius = np.hypot(xy[:, None], xy)
+        obscuration = telescope.obscuration_ratio
+        obscuration = 0.0 if obscuration is None else obscuration.value
+        amplitude = ((radius <= 1) & (radius > obscuration)).astype(float)
+    else:
+        amplitude = load_map(pupil_path)
+    if apodizer_path is not None:
+        amplitude *= load_map(apodizer_path)
+    opd = None if opd_path is None else load_map(opd_path) * u.nm
+    return Pupil(amplitude=amplitude, pitch=pitch, static_opd=opd)
 
 
 def _scalar(ini, section, key, unit):

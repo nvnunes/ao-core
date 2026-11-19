@@ -155,8 +155,7 @@ class MPSFastBatch:
             structure = self.science._phase_structure(cov, proj)
             for key in users[positions[i]]:
                 optics = optics_by_key[key]
-                wave, _, _ = key
-                phase_scale = self.wavelength_m / wave
+                phase_scale = self.wavelength_m / key[0]
                 scaled = structure if phase_scale == 1.0 else structure * phase_scale**2
                 means, kernels, coherence = optics.metric_response(
                     scaled, lag_grid=True

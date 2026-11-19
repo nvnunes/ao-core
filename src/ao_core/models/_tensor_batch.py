@@ -1,4 +1,4 @@
-"""Bounded tensor batches for the retained modal sampling-error model.
+"""Bounded tensor batches for the retained modal sampling uncertainty model.
 
 CPU tensors use double precision as a numerical reference. MPS tensors use
 single precision; covariance factorization and fixed reconstruction products

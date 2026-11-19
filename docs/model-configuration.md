@@ -23,9 +23,9 @@ parameter with their original units.
 ```python
 from astropy import units as u
 
-from ao_core.models.config import AOConfiguration, AtmosphereConfig, SourceConfig
+from ao_core.models.config import Configuration, AtmosphereConfig, SourceConfig
 
-system = AOConfiguration(
+system = Configuration(
     atmosphere=AtmosphereConfig(
         reference_wavelength=500 * u.nm,
         fried_parameter=18 * u.cm,
@@ -74,10 +74,10 @@ from the same file. It returns the resolved source path and the
 case-sensitive parser.
 
 ```python
-from ao_core.models.config import AOConfiguration, read_ini
+from ao_core.models.config import Configuration, read_ini
 
-ini_path, ini = read_ini("system.ini")
-system = AOConfiguration.from_ini(ini)
+ini_path, ini_parser = read_ini("system.ini")
+system = Configuration.from_ini(ini_parser, ini_path=ini_path)
 ```
 
 `parse_ini` reads INI text. `read_ini_scalar` and `read_ini_array` read finite

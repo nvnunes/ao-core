@@ -5,20 +5,23 @@ from dataclasses import fields
 import numpy as np
 import pytest
 from astropy import units as u
+from astropy.io import fits
 
 from ao_core.models.config import (
-    AOConfiguration,
     AtmosphereConfig,
+    Configuration,
     DetectorConfig,
     FittingConfig,
     LensletConfig,
     LoopConfig,
+    Pupil,
     SourceConfig,
     TelescopeConfig,
     load_ao_configuration,
     parse_ini,
     read_ini,
 )
+from ao_core.models.uncertainty import SamplingSettings
 
 
 def test_file_and_direct_inputs_agree(tmp_path):
@@ -87,8 +90,11 @@ LoopDelaySteps_LO = 1
 """,
         encoding="utf-8",
     )
-    _, parsed = read_ini(path)
-    expected = AOConfiguration(
+    amplitude = np.ones((256, 256))
+    fits.writeto(tmp_path / "pupil.fits", amplitude)
+    ini_path, parsed = read_ini(path)
+    expected = Configuration(
+        pupil=Pupil(amplitude=amplitude, pitch=(8 / 256) * u.m),
         telescope=TelescopeConfig(
             diameter=800 * u.cm,
             obscuration_ratio=15 * u.percent,
@@ -139,11 +145,17 @@ LoopDelaySteps_LO = 1
             gain=0.4 * u.one, frame_rate=400 * u.Hz, delay_frames=1
         ),
     )
-    for actual in (load_ao_configuration(path), AOConfiguration.from_ini(parsed)):
+    for actual in (
+        load_ao_configuration(path),
+        Configuration.from_ini(parsed, ini_path=ini_path),
+    ):
         for group in fields(expected):
             left = getattr(actual, group.name)
             right = getattr(expected, group.name)
             assert type(left) is type(right)
+            if right is None or isinstance(right, (tuple, SamplingSettings)):
+                assert left == right
+                continue
             for field in fields(right):
                 read = getattr(left, field.name)
                 direct = getattr(right, field.name)
@@ -151,6 +163,8 @@ LoopDelaySteps_LO = 1
                     assert read.unit == direct.unit
                     assert read.dtype == np.float64
                     np.testing.assert_allclose(read.value, direct.value, atol=1e-14)
+                elif isinstance(direct, np.ndarray):
+                    np.testing.assert_array_equal(read, direct)
                 else:
                     assert read == direct
         assert actual.high_order_loop.frame_interval == 2 * u.ms
@@ -161,7 +175,7 @@ LoopDelaySteps_LO = 1
 
 
 def test_partial_inputs_and_derived_pitch():
-    config = AOConfiguration.from_ini(
+    config = Configuration.from_ini(
         parse_ini(
             "[telescope]\nTelescopeDiameter = 8\n"
             "[sensor_HO]\nNumberLenslets = 20\nGridOffsets = [[0.25, 0.5]]\n"
@@ -201,7 +215,7 @@ def test_direct_inputs_own_the_layer_values():
 )
 def test_ini_rejects_inconsistent_physical_fields(text, message):
     with pytest.raises(ValueError, match=message):
-        AOConfiguration.from_ini(parse_ini(text))
+        Configuration.from_ini(parse_ini(text))
 
 
 def test_direct_inputs_reject_incompatible_units_and_shapes():
@@ -219,7 +233,7 @@ def test_existing_ini_placeholders_and_native_policy_preserve_physical_inputs():
         "[RTC]\nLoopGain_LO = 'optimize'\n"
         "SensorFrameRate_LO = 500\nLoopDelaySteps_LO = 1.5"
     )
-    config = AOConfiguration.from_ini(ini)
+    config = Configuration.from_ini(ini)
     assert config.atmosphere.seeing == 0.8 * u.arcsec
     assert config.atmosphere.fried_parameter is None
     assert config.low_order_loop.gain is None

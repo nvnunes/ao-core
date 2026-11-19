@@ -8,7 +8,7 @@ import numpy as np
 from astropy import units as u
 
 from .atmosphere import frozen_flow_frequency, von_karman_spectrum
-from .config import AOConfiguration
+from .config import Configuration
 from .control import polc_transfer
 from .pupil import CORRECTION_CUTOFF, ModalPupil, quadrature
 from .reconstruction import lo_reconstructor
@@ -49,6 +49,45 @@ def _polar_response(pupil, fx, fy, angular):
     return response.reshape(len(pupil.basis), -1)
 
 
+def _ideal_modal_lgs_factors(
+    fx,
+    fy,
+    layer_height_m,
+    beacon_height_m,
+    directions_rad,
+    *,
+    project_pupil,
+    uncontracted_modes,
+):
+    """Return the higher-order modal amplitudes and beacon phases for one layer.
+
+    The spatial frequencies are in inverse metres. The beacon height and
+    layer height are in metres in the supplied propagation geometry. The
+    factors have shapes (higher-order mode, sample) and (beacon, sample).
+    The pupil projector uses the caller's existing Fourier grid convention.
+    """
+    cone = 1 - layer_height_m / beacon_height_m
+    modes = (uncontracted_modes if cone == 1 else project_pupil(cone * fx, cone * fy))[
+        2:
+    ]
+    phase = np.exp(
+        2j
+        * np.pi
+        * layer_height_m
+        * (directions_rad[:, :1] * fx + directions_rad[:, 1:] * fy)
+    )
+    return modes, phase
+
+
+def _expand_modal_lgs_response(modes, phase, *, out=None):
+    """Form beacon-major WFS channels by multiplying the two layer factors."""
+    shape = (len(phase), *modes.shape)
+    if out is not None:
+        out = out.reshape(shape)
+    response = np.multiply(phase[:, None], modes[None], out=out)
+    return response.reshape(shape[0] * shape[1], shape[2])
+
+
 class FieldCovariance:
     """Shared modal atmospheric residual, with field-dependent MOAO correction.
 
@@ -61,14 +100,18 @@ class FieldCovariance:
     beacon height projected for the observing geometry. Direction queries
     use radians. Spectra use the modal basis in radians squared at the
     requested wavelength. With common_only, the residual includes only
-    the common high-order correction.
+    the common high-order correction. A temporal grid with dt=None retains
+    only the occupied range of frequency bins, bounded by the native
+    controller cadence. For common-only or instantaneous calculations,
+    period=None prepares covariance
+    without generating temporal bins.
     """
 
     compact = False
 
     def __init__(
         self,
-        configuration: AOConfiguration,
+        configuration: Configuration,
         pupil: ModalPupil,
         wavelength: u.Quantity,
         radial=40,
@@ -95,6 +138,8 @@ class FieldCovariance:
         stored_modes = factored or common_only
         if common_only and tilt_noise_prior is not None:
             raise ValueError("A common-only field has no low-order noise prior")
+        if period is None and not (common_only or instantaneous):
+            raise ValueError("A temporal Fourier period is required for science lags")
         self.paired_temporal = compact and angular % 2 == 0
         self.angular_samples = angular
         if factored and angular % 2 == 0:
@@ -213,22 +258,22 @@ class FieldCovariance:
         ):
             weights = self.weights[selection]
             weights[:] = density * fraction * area
-            cone = 1 - height / beacon
-            contracted = (
-                original if cone == 1 else response_on_grid(cone * fx, cone * fy)
-            )[2:]
-            phase = np.exp(2j * np.pi * height * (lgs[:, :1] * fx + lgs[:, 1:] * fy))
+            contracted, phase = _ideal_modal_lgs_factors(
+                fx,
+                fy,
+                height,
+                beacon,
+                lgs,
+                project_pupil=response_on_grid,
+                uncontracted_modes=original,
+            )
             if stored_modes:
                 self.lgs_modes[:, selection] = contracted
                 self.lgs_phase[:, selection] = phase
             else:
-                measured = self.weighted_measurement[:, selection]
-                np.multiply(
-                    phase[:, None],
-                    contracted[None],
-                    out=measured.reshape(4, h, samples),
+                _expand_modal_lgs_response(
+                    contracted, phase, out=self.weighted_measurement[:, selection]
                 )
-                del measured
             mean_phase = fitweights @ np.exp(
                 2j * np.pi * height * (fitxy[:, :1] * fx + fitxy[:, 1:] * fy)
             )
@@ -384,7 +429,7 @@ class FieldCovariance:
             ).reshape(2 * len(ngs), -1)
             self.lo[:, selection] = np.einsum("fij,jf->if", transfer, sensed)
             self.spatial[selection] = height * wave_nodes
-        if instantaneous:
+        if instantaneous or period is None:
             return
         bins = np.rint(frequencies * period).astype(int)
         self.zero = bins == 0
@@ -394,15 +439,20 @@ class FieldCovariance:
         self.positive = positive[np.argsort(bins[positive], kind="stable")]
         selected = bins[self.positive]
         self.bin_values, self.starts = np.unique(selected, return_index=True)
-        self.ends = np.r_[self.starts[1:], len(self.positive)]
+        self.ends = np.searchsorted(selected, self.bin_values, side="right")
         self.positive_weights = self.weights[self.positive]
-        self.bin_count = round(period / dt) // 2 + 1
-        largest_bin = (
+        largest_bin = int(
             np.max(np.abs(bins))
             if self.paired_temporal
             else self.bin_values.max(initial=0)
         )
-        if largest_bin >= self.bin_count - 1:
+        if dt is None:
+            self.bin_count = largest_bin + 1
+            nyquist_bin = (round(period / ho_interval) + 1) // 2
+        else:
+            self.bin_count = round(period / dt) // 2 + 1
+            nyquist_bin = self.bin_count - 1
+        if largest_bin >= nyquist_bin:
             raise ValueError("Temporal quadrature exceeds retained Nyquist range")
 
     def at_wavelength(self, wavelength: u.Quantity):
@@ -415,7 +465,7 @@ class FieldCovariance:
         """Expand the four LGS responses for a tile of the factored grid."""
         modes = self.lgs_modes[:, samples]
         phase = self.lgs_phase[:, samples]
-        return (phase[:, None] * modes[None]).reshape(4 * len(modes), -1)
+        return _expand_modal_lgs_response(modes, phase)
 
     def factored_residual(self, samples, common):
         """Apply the common correction and controller delay to one LGS tile."""
@@ -484,7 +534,7 @@ class FieldCovariance:
 
     def zero_lag_weights(self, native_count):
         """Weight Fourier samples as the retained real inverse series at zero lag."""
-        if self.instantaneous:
+        if self.instantaneous or self.period is None:
             raise ValueError("Temporal lag weights require a temporal grid")
         if getattr(self, "paired_temporal", False):
             bins = np.abs(self.temporal_bins)
@@ -520,7 +570,7 @@ class FieldCovariance:
         return response
 
     def spectrum(self, theta, *, terms=None):
-        if self.instantaneous:
+        if self.instantaneous or self.period is None:
             raise ValueError("A temporal spectrum requires a temporal grid")
         response = self.residual_response(theta, terms=terms)
         spectrum = np.zeros((self.bin_count, self.nmodes, self.nmodes), complex)

@@ -10,24 +10,28 @@ from ._ini import (
     resolve_ini_path,
 )
 from ._physical_config import (
-    AOConfiguration,
     AtmosphereConfig,
+    Configuration,
     DetectorConfig,
     FittingConfig,
     LensletConfig,
     LoopConfig,
+    NaturalGuideStar,
+    Pupil,
     SourceConfig,
     TelescopeConfig,
     load_ao_configuration,
 )
 
 __all__ = [
-    "AOConfiguration",
     "AtmosphereConfig",
+    "Configuration",
     "DetectorConfig",
     "FittingConfig",
     "LensletConfig",
     "LoopConfig",
+    "NaturalGuideStar",
+    "Pupil",
     "SourceConfig",
     "TelescopeConfig",
     "ini_to_mapping",

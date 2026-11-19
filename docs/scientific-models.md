@@ -54,39 +54,112 @@ and `settling_cut` cover scalar feedback and its settling window.
 `lo_reconstructor` accepts numerical covariance arrays in mas². Use
 `solve_lo_reconstructor` for the equivalent quantity-based API.
 
-## Sampling Predictor
+## Sampling Uncertainty
 
-`SamplingConfiguration` combines the shared physical configuration with
-sampled pupil amplitude, static OPD, a native frame interval and guide-star
-descriptors for the design prior. `SamplingRequest` specifies Cartesian
-positions, wavelength, science pixel scale and exposure windows.
-`SamplingPredictor` reuses detector and Fourier-grid preparation across
-compatible requests. Fast contracts the modal covariance through finite
-Gaussian order. Balanced keeps all orders of the modal covariance. Full
-uses the restored pupil covariance for all orders. These automatic models
-share the restored mean PSF and measure EE100 in a 100 mas square centered
-at the nominal source. They use the four-beacon geometry of `FieldCovariance`.
-Balanced and Full submitted together share a Sobol proposal where physical
-configuration, science wavelength, pixel scale, field point and grid match.
+`SamplingUncertaintyModel` predicts finite-exposure sampling uncertainty. Supply a
+shared `Configuration` and specify the science wavelength, Cartesian field
+positions, and exposure durations on `UncertaintyRequest`. The model derives
+the PSF pixel scale from the wavelength and pupil Fourier grid.
 
-For peak-centered EE100 and an explicit Fourier grid, pass
-`SamplingNumerics` and select `limited-order`, `all-order` or `full-pupil`.
-The explicit all-order and full-pupil options evaluate one native frame.
-Those options and limited order with `restore_mean=True` require CPU.
+```python
+from astropy import units as u
+
+from ao_core.models.config import Configuration, NaturalGuideStar, read_ini
+from ao_core.models.uncertainty import SamplingUncertaintyModel, UncertaintyRequest
+
+ini_path, ini_parser = read_ini("system.ini")
+base_config = Configuration.from_ini(ini_parser, ini_path=ini_path)
+ngs = [NaturalGuideStar(position=[15, -5] * u.arcsec, flux=150_000 * u.photon / u.s)]
+config = base_config.with_updates(ngs=ngs, zenith_angle=20 * u.deg)
+request = UncertaintyRequest(
+    config=config,
+    wavelength=1.65 * u.um,
+    positions=[[0, 0], [25, 0]] * u.arcsec,
+    exposures=[0.5, 1.0] * u.s,
+    model_type="fast",
+)
+result = SamplingUncertaintyModel(device="cpu").predict(request)
+```
+
+`with_updates()` returns a new configuration. Supply the NGS collection
+in Cartesian angular order with incident photon rates at the NGS sensor.
+The model derives the photon counts and native frame interval from the
+common HO and LO loop rate. The five-pixel detector uses `[sensor_LO]`
+`PixelScale`, `SigmaRON` and `ThresholdWCoG`.
+
+`Configuration.from_ini()` resolves relative pupil, apodizer and static
+OPD paths against `ini_path`. It uses `[telescope] TelescopeDiameter`
+and `Resolution` for sample pitch. For in-memory use, pass a `Pupil`
+with amplitude, pitch and optional static OPD to `Configuration()` or
+`with_updates(pupil=pupil)`. An explicit zenith angle takes precedence
+over `[telescope] ZenithAngle`. During preparation the sampling model
+resolves zenith `Seeing` or the Fried parameter using the P3 convention,
+then projects the atmosphere and finite beacon height once.
+
+Multiple NGSs require `ngs_noise_covariance` on the request. This is
+the angular measurement-noise covariance used to determine the
+reconstructor weights. Its axes are interleaved x/y in configured
+NGS order. A calibrated covariance can be passed directly. To calculate
+one from a supplied EE/FWHM convention, use
+`gaussian_ngs_noise_covariance(config, ee=ee, fwhm=fwhm)`.
+
+`predict_many()` retains input request order and reuses compatible
+preparation across points, wavelengths and exposures. Fast contracts the
+modal covariance through finite Gaussian order. Balanced keeps all orders
+of the modal covariance. Full uses the restored pupil covariance for all
+orders. All three use the restored mean PSF and measure EE100 in a 100 mas square
+centered at the nominal source. The sampling calculation uses four laser
+beacons. Fast optionally accepts `FastSettings(remove_science_tilt=True)`
+as `model_settings`.
 
 CPU uses float64. The `metal` installation extra supplies PyTorch for
 `device="mps"`, which uses float32 for Metal contractions. `dtype` can
 explicitly confirm the selected device precision.
-Automatic grids accept whole native-frame exposures up to 20 s, with
-Metal available through 10 s. Nonfinite Metal remainders use CPU quadrature.
+The spatial grid schedule covers whole native-frame exposures up to 20 s.
+Metal is used through 10 s, with CPU quadrature for nonfinite Metal remainders.
 
-Use `predict_fast_means` with one Fast exposure to obtain only the mean
-metric fields.
+### Sampling Settings
 
-Results retain point and exposure order. A metric's `mean` holds the
-first requested exposure's estimate at each point. `mean_by_exposure`,
-one-realization variance and fractional sampling coefficient use
-`(exposure, point)` axes. The coefficient is in square-root seconds. For a single
-realization of duration (T), divide the coefficient by
-`sqrt(T)` for relative standard deviation. To average a supplied
-lag covariance over independent realizations, use `exposure_variance`.
+The optional `[sampling_uncertainty_model]` section maps directly to
+`config.sampling_uncertainty_model`, a `SamplingSettings` record. Both
+construction paths use the defaults below for omitted values.
+
+```ini
+[sampling_uncertainty_model]
+modal_pupil_samples = 64
+science_pupil_samples = 64
+sensing_pupil_samples = 96
+zernike_radial_order = 11
+sensing_radial_nodes = 40
+sensing_angular_nodes = 48
+science_min_radial_nodes = 80
+science_min_angular_nodes = 192
+```
+
+Pupil sample counts are per side. The science node counts are lower
+bounds applied to the exposure-dependent spatial grid. The science Fourier
+period is the larger of twice the exposure and four pupil crossing times
+at the slowest nonzero wind speed. It is rounded up to whole native frames.
+For an entirely stationary atmosphere, the period is twice the exposure.
+The model derives the occupied frequency bins and evaluates the lags at
+the native frame cadence.
+
+### Predictions
+
+An `UncertaintyPrediction` retains point and exposure order. Each
+`UncertaintyMetricPrediction.mean` gives one reference mean per field point.
+The model evaluates it at zero lag on the configured baseline spatial Fourier
+grid using `science_min_radial_nodes` and `science_min_angular_nodes`. Variance
+and sampling uncertainty coefficient have `(exposure, point)` axes. For each
+duration `T`, the coefficient is `sqrt(T * variance) / mean` in square-root
+seconds. Divide by `sqrt(T)` for the relative standard deviation of one
+realization.
+
+Pass `diagnostics=True` to `predict()` or `predict_many()` to inspect the
+temporal quadrature grids and their grid-specific means. The diagnostic grids
+give radial and angular node counts and periods in seconds, in exposure order.
+`diagnostics.mean_by_exposure` maps each metric to its means on those grids
+with `(exposure, point)` axes. By default `diagnostics` is `None`.
+
+To average a supplied lag covariance over independent realizations, use
+`exposure_variance`.

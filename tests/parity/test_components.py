@@ -7,8 +7,8 @@ import pytest
 from astropy import units as u
 
 from ao_core.models.config import (
-    AOConfiguration,
     AtmosphereConfig,
+    Configuration,
     FittingConfig,
     LoopConfig,
     SourceConfig,
@@ -82,6 +82,25 @@ def test_detector_flux_and_conditional_moments_match_pinned_sources(
     assert_numerical_parity(
         actual["mass_error"].value, ref["mass_error"][index], scale=1
     )
+
+
+def test_bright_zero_threshold_centroid_converges():
+    flux = np.vstack((np.full(25, 10.0), np.linspace(0.0, 9400.0, 25))) * u.photon
+    conversion = np.eye(2) * u.mas / u.pix
+    detector = DirectCentroid(flux.max(), conversion, threshold=0 * u.electron)
+    actual = detector.calculate(flux, jacobian=True)
+    refined = DirectCentroid(
+        flux.max(), conversion, threshold=0 * u.electron, nodes=256
+    ).calculate(flux, jacobian=True)
+
+    np.testing.assert_allclose(actual["mass_error"].value, 0, atol=1e-10)
+    np.testing.assert_allclose(actual["mean"].value[0], 0, atol=1e-13)
+    assert np.all(np.linalg.eigvalsh(actual["covariance"].value) > 0)
+    # The covariance subtracts two raw moments much larger than its bright value.
+    for name in ("mean", "covariance", "jacobian"):
+        np.testing.assert_allclose(
+            actual[name].value, refined[name].value, rtol=1e-8, atol=1e-12
+        )
 
 
 def test_signed_optical_derivative_matches_sampling_route(detector_reference):
@@ -189,7 +208,7 @@ def _polar(radii, azimuths):
 @pytest.fixture(scope="module")
 def modal_configuration(modal_reference):
     ref = modal_reference
-    return AOConfiguration(
+    return Configuration(
         atmosphere=AtmosphereConfig(
             reference_wavelength=ref["reference_wave"] * u.m,
             fried_parameter=ref["r0"] * u.m,
@@ -238,7 +257,7 @@ def modal_pupil(modal_reference):
     )
 
 
-def _modal_field(configuration, pupil, ref):
+def _modal_field(configuration, pupil, ref, *, derive_bins=False):
     return FieldCovariance(
         configuration,
         pupil,
@@ -246,7 +265,7 @@ def _modal_field(configuration, pupil, ref):
         int(ref["radial"]),
         int(ref["angular"]),
         float(ref["period"]),
-        float(ref["dt"]),
+        None if derive_bins else float(ref["dt"]),
         tilt_noise_prior=ref["prior"],
         sensing_gains=ref["gains"],
         sensing_ho=ref["sensing"],
@@ -266,6 +285,12 @@ def test_interpolated_modal_spectrum_and_ngs_covariance_match_pinned_sampling(
         field.residual_response(ref["theta"]), ref["residual_response"]
     )
     assert_numerical_parity(field.spectrum(ref["theta"]), ref["spectrum"])
+    derived = _modal_field(modal_configuration, pupil, ref, derive_bins=True)
+    spectrum = derived.spectrum(ref["theta"])
+    assert len(spectrum) < len(ref["spectrum"])
+    padded = np.zeros_like(ref["spectrum"])
+    padded[:len(spectrum)] = spectrum
+    assert_numerical_parity(padded, ref["spectrum"])
     ngs = (np.array([10.0, -7.0]) * u.arcsec).to_value(u.rad)
     assert_numerical_parity(field.ngs_ho_covariance(ngs), ref["guide_covariance"])
 
@@ -466,6 +491,20 @@ def test_common_ho_only_field_retains_uncorrected_tilt(
     assert np.isfinite(common.spectrum(ref["theta"])).all()
     assert_numerical_parity(
         common.ngs_ho_covariance(ref["theta"]), field.ngs_ho_covariance(ref["theta"])
+    )
+
+    zero_lag = FieldCovariance(
+        modal_configuration,
+        modal_pupil,
+        ref["wave"] * u.m,
+        int(ref["radial"]),
+        int(ref["angular"]),
+        period=None,
+        common_only=True,
+    )
+    assert_numerical_parity(
+        zero_lag.ngs_ho_covariance(ref["theta"]),
+        field.ngs_ho_covariance(ref["theta"]),
     )
 
 

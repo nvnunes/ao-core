@@ -14,7 +14,9 @@ Use the repository-local Conda environment described in
 
 The test suite checks the public import and its version against the installed
 distribution metadata. The strict site build checks navigation and generates
-the Python reference from the package.
+the Python reference from the package. Photometry tests check fixed numerical
+results, equivalent units, input and output shapes, inverse conversions and
+invalid inputs.
 
 For packaging changes, inspect the source distribution and wheel, then install
 the wheel and import `ao_core` in an isolated environment outside the source

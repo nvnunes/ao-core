@@ -7,6 +7,10 @@ module defines the result-file format and reads and writes its datasets.
 Producers calculate their outputs, define additional fields and manage batch
 execution and resumption.
 
+`ao_core.photometry` defines unit-aware NGS magnitude and WFS photon
+conversions. The caller supplies the calibration and applies any
+instrument-specific rounding. See the [photometry guide](photometry.md).
+
 The package root exposes `__version__`. The
 [API guide](api.md) and [Python reference](reference/api.md) describe
 supported interfaces.

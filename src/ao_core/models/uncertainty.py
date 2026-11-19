@@ -440,7 +440,9 @@ class _PreparedGrid:
         *,
         compact=False,
         grid_settings=None,
+        spectral_interval=None,
         instantaneous=False,
+        common_only=False,
     ):
         self.configuration = configuration
         self.pupil = configuration.pupil.amplitude
@@ -448,20 +450,27 @@ class _PreparedGrid:
         self.radial_order, angular, period = grid
         self.grids = ((period, angular),)
         self.instantaneous = instantaneous
+        self.common_only = common_only
         if grid_settings is None:
             settings = configuration.sampling_uncertainty_model
             self.science_side = settings.science_pupil_samples
             self.modal_order = settings.zernike_radial_order
             self.reference_side = settings.modal_pupil_samples
             self.angular_offset = _SCIENCE_ANGULAR_OFFSET
-            self.spectral_interval = None
+            self.spectral_interval = spectral_interval
         else:
             self.science_side = grid_settings.optical_side
             self.modal_order = grid_settings.modal_order
             self.reference_side = grid_settings._reference_side
             self.angular_offset = grid_settings.angular_offset
             self.spectral_interval = grid_settings.spectral_interval_s
-        self.dt = _sampling_frame_interval(configuration)
+        if common_only:
+            ho = _required(
+                configuration.high_order_loop, "High-order loop", "frame_rate"
+            )
+            self.dt = float(ho.frame_interval.to_value(u.s))
+        else:
+            self.dt = _sampling_frame_interval(configuration)
         self.windows = {}
         for time in exposures:
             frames = round(time / self.dt)
@@ -527,19 +536,23 @@ class _PreparedGrid:
                 sensing_ho=responses,
                 angular_offset=self.angular_offset,
                 compact=self.compact,
+                common_only=self.common_only,
             )
-            r = context.tilt_reconstructor
-            lo = config.low_order_loop
-            self._noise_lags = (
-                integrator_noise_lags(
-                    context.tilt_feedback,
-                    r @ innovations @ r.T,
-                    float(lo.gain.value),
-                    int(lo.delay_frames),
-                    self.max_count,
+            if innovations is None:
+                self._noise_lags = np.zeros((self.max_count, 2, 2))
+            else:
+                r = context.tilt_reconstructor
+                lo = config.low_order_loop
+                self._noise_lags = (
+                    integrator_noise_lags(
+                        context.tilt_feedback,
+                        r @ innovations @ r.T,
+                        float(lo.gain.value),
+                        int(lo.delay_frames),
+                        self.max_count,
+                    )
+                    * context.scale**2
                 )
-                * context.scale**2
-            )
             self._context = context
         return self._context
 
@@ -648,6 +661,12 @@ class SamplingUncertaintyModel:
             frame_interval=frame_interval,
             minimum_period_frames=minimum_period_frames,
         )
+        return self._predict_on_grids(requests, science_grid, diagnostics=diagnostics)
+
+    def _predict_on_grids(
+        self, requests, science_grid, *, diagnostics, spectral_interval=None
+    ):
+        """Evaluate one physical configuration on the caller's exposure grids."""
         all_fast = all(request.model_type == "fast" for request in requests)
         dense_long_grids = {
             (_science_band(request), science_grid(exposure))
@@ -686,7 +705,9 @@ class SamplingUncertaintyModel:
 
         for (grid, accelerated, _), bands in jobs.items():
             if accelerated:
-                batches = self._fast_band_batches(grid, bands, representatives)
+                batches = self._fast_band_batches(
+                    grid, bands, representatives, spectral_interval=spectral_interval
+                )
             else:
                 band = next(iter(bands))
                 windows = _band_windows(bands)
@@ -696,6 +717,7 @@ class SamplingUncertaintyModel:
                     grid,
                     windows,
                     compact=False,
+                    spectral_interval=spectral_interval,
                 )
                 batches = (
                     (
@@ -871,11 +893,13 @@ class SamplingUncertaintyModel:
             self._sensing_key = sensing_key
         return self._sensing
 
-    def _prepare_grid(self, request, device, grid, windows, *, compact):
+    def _prepare_grid(
+        self, request, device, grid, windows, *, compact, spectral_interval=None
+    ):
         projected, sensing = self._prepare_detector(request, device)
         wavelength = float(request.wavelength.value)
         sensing_key = self._sensing_key
-        key = (sensing_key, grid, windows, compact)
+        key = (sensing_key, grid, windows, compact, spectral_interval)
         if key != self._grid_key:
             self._prepared = self._grid_key = None
             if device == "mps":
@@ -883,7 +907,13 @@ class SamplingUncertaintyModel:
 
                 torch.mps.empty_cache()
             prepared = _PreparedGrid(
-                projected, wavelength, windows, grid, sensing, compact=compact
+                projected,
+                wavelength,
+                windows,
+                grid,
+                sensing,
+                compact=compact,
+                spectral_interval=spectral_interval,
             )
             optics = self._optics(prepared, request)
             engine = self._engine(device, compact, prepared, optics)
@@ -912,7 +942,7 @@ class SamplingUncertaintyModel:
 
         return MPSFastBatch(optics.science, prepared)
 
-    def _fast_band_batches(self, grid, bands, representatives):
+    def _fast_band_batches(self, grid, bands, representatives, *, spectral_interval):
         keys = tuple(bands)
         for start in range(0, len(keys), _MAX_FAST_OPTICS):
             chunk = {key: bands[key] for key in keys[start : start + _MAX_FAST_OPTICS]}
@@ -925,14 +955,30 @@ class SamplingUncertaintyModel:
                 representatives,
                 _covariance_device(self.device, duration),
                 compact=duration > MAX_MPS_EXPOSURE,
+                spectral_interval=spectral_interval,
             )
 
-    def _fast_points(self, grid, windows, bands, representatives, device, *, compact):
+    def _fast_points(
+        self,
+        grid,
+        windows,
+        bands,
+        representatives,
+        device,
+        *,
+        compact,
+        spectral_interval,
+    ):
         optics = {}
         users = defaultdict(list)
         for band, points in bands.items():
             prepared, engine, optics[band] = self._prepare_grid(
-                representatives[band], device, grid, windows, compact=compact
+                representatives[band],
+                device,
+                grid,
+                windows,
+                compact=compact,
+                spectral_interval=spectral_interval,
             )
             for xy in points:
                 users[xy].append(band)

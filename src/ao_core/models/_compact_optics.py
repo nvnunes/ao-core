@@ -163,9 +163,11 @@ class CompactScienceOptics:
         *,
         remove_science_tilt=False,
         atmosphere_at_frame=None,
+        detector_side=None,
     ):
         self.predictor = predictor
         self._atmosphere_at_frame = atmosphere_at_frame
+        self._detector_side = detector_side
         self.pixel = predictor.metadata["pixel_scale_mas"]
         wave = predictor.metadata["wavelength_m"]
         support = predictor.metadata["support_m"]
@@ -273,6 +275,21 @@ class CompactScienceOptics:
         waves = np.exp(-1j * centre[:, None] * self.frequency)
         return waves[1, :, None] * waves[0] / norm
 
+    def _valid_mean_psf(self, image):
+        if not np.isfinite(image).all() or abs(image.sum() - 1) > 1e-9:
+            return False
+        if image.min() >= -1e-12:
+            return True
+        if self._detector_side is None:
+            return False
+        # Compact-to-native OTF interpolation can ring in the far wings.
+        half = self._detector_side // 2
+        detector = np.arange(-half, self._detector_side - half) % self.size
+        return (
+            image[np.ix_(detector, detector)].min() >= -1e-12
+            and -image[image < 0].sum() <= 1e-8
+        )
+
     def _kernels(self, mean_otf, *, means_only=False):
         norm = self.size**2 * self.flux
         centre = np.zeros(2)
@@ -298,7 +315,7 @@ class CompactScienceOptics:
         plane = np.zeros((self.size, self.size // 2 + 1), complex)
         plane[self.fft_index] = mean_otf[:, self.native_side - 1 :]
         image = hfft2(plane, s=(self.size, self.size)) / norm
-        if abs(image.sum() - 1) > 1e-9 or image.min() < -1e-12:
+        if not self._valid_mean_psf(image):
             raise ValueError(
                 "Compact static transfer did not produce a nonnegative, unit-flux mean PSF"
             )
@@ -384,6 +401,10 @@ class CompactScienceOptics:
 
     def restore_phase(self, position):
         """Return the pupil phase structure function and zero-lag modal covariance."""
+        if self.science.context.common_only:
+            correction, coefficients = self.science.components(position)
+            projection = (self.science.waves @ coefficients.T).real
+            return self.science._phase_structure(correction, projection), None
         (structure,), lags = self.science.tiled_phase_structures(
             [position], lag_weights=self.lag_weights
         )

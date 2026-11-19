@@ -479,7 +479,8 @@ def test_long_fast_grid_is_compact_with_unrelated_short_balanced_request(
     class ReachedCompactGrid(Exception):
         pass
 
-    def check_route(grid, windows, bands, representatives, device, *, compact):
+    def check_route(grid, windows, bands, representatives, device, *, compact, spectral_interval):
+        assert spectral_interval is None
         assert grid == (320, 768, 24)
         assert device == "cpu"
         assert compact
@@ -513,7 +514,8 @@ def test_accelerated_fast_bounds_simultaneous_band_optics(
 
     batch_shapes = []
 
-    def evaluate(grid, windows, bands, representatives, device, *, compact):
+    def evaluate(grid, windows, bands, representatives, device, *, compact, spectral_interval):
+        assert spectral_interval is None
         assert device == "mps"
         batch_shapes.append((len(bands), windows))
         prepared = SimpleNamespace(

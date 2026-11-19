@@ -204,3 +204,18 @@ def remainder_draws(covariances, weights, power, replicates, seed, *, workers=1)
     return RemainderQuadrature(covariances, weights).evaluate(
         covariances, weights, power, replicates, seed, workers=workers
     )
+
+
+def integrate_all_orders(responses, power, replicates, seed, *, workers=1):
+    """Integrate instantaneous variance with shared draws for all responses."""
+    _, covariances, weights, base = (
+        np.asarray(values) for values in zip(*responses, strict=True)
+    )
+    remainders, coarse = remainder_draws(
+        covariances, weights, power, replicates, seed, workers=workers
+    )
+    variance = base + remainders.mean(axis=0)
+    coarse_variance = base + coarse.mean(axis=0)
+    if np.any(variance <= 0) or np.any(coarse_variance <= 0):
+        raise ValueError("Nonpositive instantaneous metric variance")
+    return variance, base, remainders, coarse_variance

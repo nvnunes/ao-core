@@ -12,7 +12,11 @@ from ao_core.models.optics import (
     SuppliedImageModalResponse,
     covariance_matched_displacement_otfs,
 )
-from ao_core.models.pupil import LocalCubicPupilResponse, sampled_pupil_fourier
+from ao_core.models.pupil import (
+    LocalCubicPupilResponse,
+    pupil_tilt_weights,
+    sampled_pupil_fourier,
+)
 from ao_core.models.reconstruction import factor_modal_covariance
 from ao_core.models.residual import wind_aligned_tilt_covariance
 from ao_core.models.sensing import sample_centroid_errors
@@ -33,6 +37,43 @@ def test_pupil_response_supports_scalar_queries_and_guards_nyquist_stencil():
         local(0.48, 0.0)
     with pytest.raises(ValueError, match="real"):
         sampled_pupil_fourier(weights * np.nan, 1.0, fx, fy, fft_size=16)
+
+
+@pytest.mark.parametrize("side", [4, 7])
+def test_angular_tilt_fit_and_fourier_response_share_the_native_pitch(side):
+    pitch = 0.024 * u.m
+    wavelength = 500 * u.nm
+    fft_size = 32
+    axis = (np.arange(side) - (side - 1) / 2) * pitch.value
+    x, y = np.meshgrid(axis, axis)
+    amplitude = np.triu(np.ones((side, side)))
+    amplitude[:, -1] *= 0.6
+    weights = pupil_tilt_weights(
+        amplitude, sample_pitch=pitch, reference_wavelength=wavelength
+    ).to_value(u.mas / u.rad)
+    gradient = np.array([3.0, -2.0])
+    phase = 1.23 + gradient[0] * x + gradient[1] * y
+    radians_per_mas = u.mas.to(u.rad)
+    expected = gradient * (wavelength.to_value(u.m) / (2 * np.pi * radians_per_mas))
+    np.testing.assert_allclose(
+        np.einsum("ayx,yx->a", weights, phase), expected, rtol=1e-12
+    )
+    np.testing.assert_allclose(weights.sum(axis=(1, 2)), 0, atol=1e-12)
+
+    response = LocalCubicPupilResponse(weights, pitch_m=pitch.value, fft_size=fft_size)
+    span_response = LocalCubicPupilResponse(
+        weights, (side - 1) * pitch.value, fft_size=fft_size
+    )
+    fx, fy = np.array([2.0, -1.0]) / (fft_size * pitch.value)
+    direct = np.einsum("ayx,yx->a", weights, np.exp(2j * np.pi * (fx * x + fy * y)))
+    np.testing.assert_allclose(response(fx, fy), direct, rtol=1e-12)
+    np.testing.assert_array_equal(response(fx, fy), span_response(fx, fy))
+    with pytest.raises(
+        ValueError, match="either the sample-centre span or the sample pitch"
+    ):
+        LocalCubicPupilResponse(
+            weights, (side - 1) * pitch.value, pitch_m=pitch.value, fft_size=fft_size
+        )
 
 
 def test_wind_aligned_covariance_rejects_unstable_strength_and_bad_channel_shape():

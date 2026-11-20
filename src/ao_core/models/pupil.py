@@ -18,6 +18,7 @@ __all__ = [
     "LocalCubicPupilResponse",
     "ModalPupil",
     "prepare_modal_pupil",
+    "pupil_tilt_weights",
     "sampled_pupil_fourier",
 ]
 
@@ -45,6 +46,58 @@ class ModalPupil:
         if self.spectrum is None:
             raise ValueError("This optical pupil has no modal Fourier response")
         return _cubic_pupil_response(self.spectrum, self.dx, self.fft_size, fx, fy)
+
+
+def _pupil_tilt_fit(amplitude):
+    """Return the amplitude-squared weighted ramp fit on the original pupil."""
+    size = len(amplitude)
+    axis = 2 * (np.arange(size) - (size - 1) / 2) / size
+    ramps = np.array(np.meshgrid(axis, axis))
+    weights = amplitude**2
+    centroid = np.einsum("iyx,yx->i", ramps, weights) / weights.sum()
+    # Fitting centred ramps is equivalent to including a piston intercept.
+    ramps -= centroid[:, None, None]
+    gram = np.einsum("iyx,jyx,yx->ij", ramps, ramps, weights)
+    return np.linalg.solve(gram, ramps.reshape(2, -1)).reshape(ramps.shape) * weights
+
+
+def pupil_tilt_weights(
+    amplitude: np.ndarray,
+    *,
+    sample_pitch: u.Quantity,
+    reference_wavelength: u.Quantity,
+) -> u.Quantity:
+    """Return angular tilt weights for a sampled phase in x/y order.
+
+    Supply the square pupil amplitude and centre-to-centre sample pitch.
+    The fit uses amplitude-squared weights and includes a piston intercept.
+    A boolean aperture mask gives equal weight to illuminated samples.
+    Contract the resulting (2, y, x) weights, in mas per phase radian, with
+    a phase grid at the reference wavelength to obtain the angular tilt.
+    """
+    amplitude = np.asarray(amplitude)
+    if (
+        amplitude.ndim != 2
+        or amplitude.shape[0] != amplitude.shape[1]
+        or len(amplitude) < 2
+        or amplitude.dtype.kind not in "bfiu"
+        or not np.isfinite(amplitude).all()
+        or np.any(amplitude < 0)
+        or not np.any(amplitude > 0)
+    ):
+        raise ValueError("Expected a finite nonnegative square pupil amplitude")
+    pitch = float(_quantity(sample_pitch, u.m, "sample_pitch", 0).value)
+    wavelength = float(
+        _quantity(reference_wavelength, u.m, "reference_wavelength", 0).value
+    )
+    if pitch <= 0 or wavelength <= 0:
+        raise ValueError("Sample pitch and reference wavelength must be positive")
+    # The normalized ramp coordinates span a width of two over n pixel cells.
+    gradient = _pupil_tilt_fit(amplitude.astype(float, copy=False)) * (
+        2 / (len(amplitude) * pitch)
+    )
+    radians_to_mas = 1000 / ARCSEC
+    return gradient * (wavelength / (2 * np.pi) * radians_to_mas) * (u.mas / u.rad)
 
 
 def _cubic_pupil_response(spectrum, pitch, size, fx, fy):
@@ -132,12 +185,14 @@ class LocalCubicPupilResponse:
     """Positive-exponent Fourier response of real pupil weights.
 
     The weights have shape (channel, y, x) with the caller's normalization.
-    Support is in metres. The padded FFT is evaluated with a local four-node
-    Lagrange stencil per axis. Query coordinates are cycles/m. For an
-    even pupil, the full stencil must lie inside the signed FFT bins.
+    Supply the sample pitch as `pitch_m` or the first-to-last sample-centre
+    span as `support`, both in metres. Zero padding retains that pitch. The FFT
+    is evaluated with a local four-node Lagrange stencil per axis. Query
+    coordinates are cycles/m. For an even pupil, the full stencil must lie
+    inside the signed FFT bins.
     """
 
-    def __init__(self, weights, support, *, fft_size):
+    def __init__(self, weights, support=None, *, fft_size, pitch_m=None):
         weights = np.asarray(weights)
         if (
             weights.ndim != 3
@@ -146,8 +201,6 @@ class LocalCubicPupilResponse:
             or weights.dtype.kind not in "fiu"
             or not len(weights)
             or not np.isfinite(weights).all()
-            or not np.isfinite(support)
-            or support <= 0
             or type(fft_size) is not int
             or fft_size < weights.shape[1]
             or fft_size % 2
@@ -155,7 +208,11 @@ class LocalCubicPupilResponse:
             raise ValueError("Invalid pupil weights, support or Fourier grid")
         weights = weights.astype(float, copy=False)
         side, size = weights.shape[1], fft_size
-        dx = support / (side - 1)
+        if (support is None) == (pitch_m is None):
+            raise ValueError("Supply either the sample-centre span or the sample pitch")
+        dx = support / (side - 1) if pitch_m is None else pitch_m
+        if not np.isfinite(dx) or dx <= 0:
+            raise ValueError("Sample pitch must be positive and finite")
         offset = (size - side) // 2
         fields = np.pad(
             weights,

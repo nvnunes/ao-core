@@ -111,6 +111,7 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - LocalCubicPupilResponse
         - ModalPupil
         - prepare_modal_pupil
+        - pupil_tilt_weights
         - sampled_pupil_fourier
 
 ::: ao_core.models.reconstruction

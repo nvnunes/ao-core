@@ -15,6 +15,7 @@ from .optics import (
     _phase_difference_variance_inplace,
     _sum_pairs_by_lag,
 )
+from .pupil import _pupil_tilt_fit
 
 NATIVE_OPTICAL_SIDE = 512
 
@@ -43,19 +44,6 @@ def diffraction_image(field, side, image_side, origin):
     )
 
 
-def pupil_tilt_fit(amplitude):
-    """Return the amplitude-squared weighted ramp fit on the original pupil."""
-    size = len(amplitude)
-    axis = 2 * (np.arange(size) - (size - 1) / 2) / size
-    ramps = np.array(np.meshgrid(axis, axis))
-    weights = amplitude**2
-    centroid = np.einsum("iyx,yx->i", ramps, weights) / weights.sum()
-    # Fitting centred ramps is equivalent to including a piston intercept.
-    ramps -= centroid[:, None, None]
-    gram = np.einsum("iyx,jyx,yx->ij", ramps, ramps, weights)
-    return np.linalg.solve(gram, ramps.reshape(2, -1)).reshape(ramps.shape) * weights
-
-
 class OpticalPupil:
     """Finite optical samples and their fit on the original pupil."""
 
@@ -80,7 +68,7 @@ class OpticalPupil:
         self.points = np.column_stack((self.x, self.y)) * (period / side)
         self.fit_axis = (np.arange(size) / size - 0.5) * (width * period / side)
         if tilt_removal == "pupil_fit":
-            self.tilt_fit = pupil_tilt_fit(amplitude)
+            self.tilt_fit = _pupil_tilt_fit(amplitude)
             self.ramps = (2 / width) * np.array([self.x, self.y]) + 1 / size
         else:
             self.tilt_fit = np.empty((0, size, size))

@@ -14,12 +14,12 @@ from ._ho_optics import (
     diffraction_image,
     fold_lags,
     image_from_signed_lags,
-    pupil_tilt_fit,
     sample_pupil_map,
 )
 from ._ho_reconstruction import fourier_sum
 from ._lag_transfer import CubicLagTransfer
 from .optics import _pupil_autocorrelation
+from .pupil import _pupil_tilt_fit
 
 
 def _phase_variance(phase, power):
@@ -149,7 +149,7 @@ def static_diffraction(config, phase, period, image_side):
     if config.static_opd_sampling == "original_map":
         side = original_map_side(period, pitch, len(amplitude), image_side)
         tilt_fit = (
-            pupil_tilt_fit(amplitude) if config.tilt_removal == "pupil_fit" else ()
+            _pupil_tilt_fit(amplitude) if config.tilt_removal == "pupil_fit" else ()
         )
         field = _original_field(amplitude, phase, tilt_fit)
         lags = _pupil_autocorrelation(field)

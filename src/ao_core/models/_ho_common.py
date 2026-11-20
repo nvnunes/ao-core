@@ -1,5 +1,7 @@
 """Prepare the high-order residual and render the science field."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 
@@ -15,16 +17,20 @@ from ._ho_atmosphere import (
     tangent_directions,
 )
 from ._ho_covariance import command_moments, science_command
+from ._ho_metal import MpsPupilOptics
+from ._ho_metal_queries import MpsScienceCommandQueries
 from ._ho_optics import (
     NATIVE_OPTICAL_SIDE,
     InvalidCovarianceOptics,
     OpticalPupil,
     ResidualCovariance,
     coherence_image,
+    image_from_signed_lags,
     phase_pairs_need_float64,
     precision_probe_pairs,
 )
 from ._ho_reconstruction import (
+    DirectionalCommandFit,
     MirrorSurface,
     covariance_kernel,
     estimate_commands,
@@ -217,7 +223,34 @@ def chromatic_geometry(config, wavelength):
     return zenith, refractivity_difference, fractional_difference
 
 
-def predict_common(config, period, wavelength, image_side, phase, *, dtype):
+@contextmanager
+def _field_batches(directions, batch_size, prepare_science):
+    """Yield ordered field slices and let the consumer decide when to take the fits."""
+    batches = (
+        slice(first, first + batch_size)
+        for first in range(0, len(directions), batch_size)
+    )
+    if prepare_science is None:
+        yield ((batch, None) for batch in batches)
+        return
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ao-science-dm")
+
+    def fit_ahead():
+        batch = next(batches)
+        pending = executor.submit(prepare_science, directions[batch])
+        for next_batch in batches:
+            upcoming = executor.submit(prepare_science, directions[next_batch])
+            yield batch, pending.result
+            batch, pending = next_batch, upcoming
+        yield batch, pending.result
+
+    try:
+        yield fit_ahead()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def predict_common(config, period, wavelength, image_side, phase, *, dtype, backend):
     """Evaluate the corrected residual across the science field."""
     # Keep the pupil quadrature fixed for detector crops of the native image.
     original_map = phase is not None and config.static_opd_sampling == "original_map"
@@ -268,6 +301,7 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
         field = resampled_field(pupil, config.pupil.amplitude, phase)
     residual_loop = config.residual_high_order_loop
     gain = 0.0 if residual_loop is None else residual_loop.gain.value
+    joint = None
     if gain:
         science_dm = _mirror_surface(config, lenslets, 1)
         joint = TwoStageCovariance.prepare(
@@ -280,12 +314,26 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
             gain,
         )
         basis = np.column_stack((basis, pupil.fitted_mirror(science_dm)))
+        command_means = joint.common_means
     else:
         covariance, modes, command_means = command_moments(
             grid, layers, lenslets, mirror, weights, temporal_covariance
         )
     working_basis = basis.astype(dtype, copy=False)
     probe_pairs = precision_probe_pairs(pupil) if dtype == np.float32 else None
+    metal_queries = None
+    if backend == "mps":
+        metal_queries = MpsScienceCommandQueries(
+            grid,
+            layers,
+            lenslets,
+            pupil,
+            tilt_modes,
+            weights,
+            command_means,
+            joint,
+            gain,
+        )
 
     def phase_command_cross(field_directions, science_weights, precision):
         if gain:
@@ -301,6 +349,9 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
                 gain,
                 dtype=precision,
             )
+        query_options = {}
+        if metal_queries is not None and precision == np.float32:
+            query_options["queries"] = metal_queries
         return science_command(
             grid,
             layers,
@@ -312,6 +363,7 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
             command_means,
             field_directions,
             dtype=precision,
+            **query_options,
         )
 
     if optics is None:
@@ -322,6 +374,12 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
             origin=config.detector_origin,
             field=field,
         )
+        render_lags = partial(
+            image_from_signed_lags,
+            side=pupil.side,
+            image_side=image_side,
+            origin=config.detector_origin,
+        )
     else:
         render = partial(
             optics.image,
@@ -329,6 +387,20 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
             origin=config.detector_origin,
             high_lags=high_lags,
         )
+        render_lags = partial(
+            optics.image_from_lags,
+            image_side=image_side,
+            origin=config.detector_origin,
+            high_lags=high_lags,
+        )
+    metal = None
+    if backend == "mps":
+        metal = MpsPupilOptics(
+            pupil, working_basis, field if optics is None else optics.field
+        )
+        probe_rows, probe_cross_pairs = np.unique(probe_pairs, return_inverse=True)
+        probe_cross_pairs = probe_cross_pairs.reshape(probe_pairs.shape)
+        probe_rows = metal.x.new_tensor(probe_rows)
 
     directions = config.science_sources.directions.to_value(u.rad)
     azimuths = science_azimuths(config.science_sources)
@@ -339,81 +411,114 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype):
     images = np.empty((len(directions), image_side, image_side))
     # Bound the intermediate phase/command arrays for larger fields.
     batch_size = max(1, (256 * 1024**2) // (8 * len(basis) * len(weights)))
-    for first in range(0, len(directions), batch_size):
-        batch = slice(first, first + batch_size)
-        batch_directions = directions[batch]
-        science_weights = None
-        if gain:
-            science_weights = [
-                fit_commands(
+    if metal_queries is not None:
+        batch_size = min(batch_size, metal_queries.direction_batch_size)
+    prepare_science = None
+    if gain and metal is not None and len(directions):
+        preparation = DirectionalCommandFit(
+            grid, layers, lenslets, science_dm, factor, dtype
+        )
+        prepare_science = preparation.fit_batch
+    with _field_batches(directions, batch_size, prepare_science) as batches:
+        for batch, take_science_weights in batches:
+            batch_directions = directions[batch]
+            if take_science_weights is not None:
+                streams = metal_queries.two_stage_streams(batch_directions, joint)
+                science_weights = take_science_weights()
+                cross = metal_queries.contract_two_stage_cross(streams, science_weights)
+                del streams
+            else:
+                science_weights = None
+                if gain:
+                    science_weights = [
+                        fit_commands(
+                            grid,
+                            layers,
+                            lenslets,
+                            science_dm,
+                            direction[None],
+                            (1.0,),
+                            factor,
+                            dtype=dtype,
+                        )
+                        for direction in batch_directions
+                    ]
+                cross = phase_command_cross(batch_directions, science_weights, dtype)
+            if gain:
+                covariances = [
+                    joint.command_covariance(command_weights)
+                    for command_weights in science_weights
+                ]
+            else:
+                covariances = [covariance] * len(batch_directions)
+            for index, (image, azimuth, phase_command, command_covariance) in enumerate(
+                zip(images[batch], azimuths[batch], cross, covariances, strict=True)
+            ):
+                chromatic = chromatic_power(
                     grid,
                     layers,
-                    lenslets,
-                    science_dm,
-                    direction[None],
-                    (1.0,),
-                    factor,
-                    dtype=dtype,
+                    fft_side,
+                    cutoff,
+                    refractivity_difference,
+                    fractional_difference,
+                    zenith,
+                    azimuth,
                 )
-                for direction in batch_directions
-            ]
-            covariances = [
-                joint.command_covariance(command_weights)
-                for command_weights in science_weights
-            ]
-        else:
-            covariances = [covariance] * len(batch_directions)
-        cross = phase_command_cross(batch_directions, science_weights, dtype)
-        for index, (image, azimuth, phase_command, command_covariance) in enumerate(
-            zip(images[batch], azimuths[batch], cross, covariances, strict=True)
-        ):
-            chromatic = chromatic_power(
-                grid,
-                layers,
-                fft_side,
-                cutoff,
-                refractivity_difference,
-                fractional_difference,
-                zenith,
-                azimuth,
-            )
-            extra = pupil.stationary_moments(chromatic.sum(axis=0), auxiliary_modes)
-            field_source = tuple(a + b for a, b in zip(source, extra, strict=True))
-            use_float64 = probe_pairs is not None and phase_pairs_need_float64(
-                pupil,
-                probe_pairs,
-                field_source,
-                basis,
-                command_covariance,
-                phase_command,
-            )
-            if not use_float64:
-                residual = ResidualCovariance(
-                    pupil,
-                    field_source,
-                    working_basis,
-                    command_covariance,
-                    phase_command,
-                    dtype=dtype,
-                )
-                try:
-                    image[:] = render(residual)
-                except InvalidCovarianceOptics:
-                    if probe_pairs is None:
-                        raise
-                else:
-                    continue
+                extra = pupil.stationary_moments(chromatic.sum(axis=0), auxiliary_modes)
+                field_source = tuple(a + b for a, b in zip(source, extra, strict=True))
+                use_float64 = False
+                if probe_pairs is not None:
+                    probe_cross = phase_command
+                    probe_options = {}
+                    if metal is not None:
+                        probe_cross = phase_command[probe_rows].cpu().numpy()
+                        probe_options["cross_pairs"] = probe_cross_pairs
+                    use_float64 = phase_pairs_need_float64(
+                        pupil,
+                        probe_pairs,
+                        field_source,
+                        basis,
+                        command_covariance,
+                        probe_cross,
+                        **probe_options,
+                    )
+                if not use_float64:
+                    try:
+                        if metal is None:
+                            image[:] = render(
+                                ResidualCovariance(
+                                    pupil,
+                                    field_source,
+                                    working_basis,
+                                    command_covariance,
+                                    phase_command,
+                                    dtype=dtype,
+                                )
+                            )
+                        else:
+                            image[:] = render_lags(
+                                metal.coherence_lags(
+                                    field_source, command_covariance, phase_command
+                                )
+                            )
+                    except InvalidCovarianceOptics:
+                        if probe_pairs is None:
+                            raise
+                    else:
+                        continue
 
-            # Rebuild the cross moments for this point before rendering in
-            # float64. The fitted commands and joint covariance can be reused.
-            point = slice(index, index + 1)
-            point_weights = None if science_weights is None else science_weights[point]
-            precise_cross = phase_command_cross(
-                batch_directions[point], point_weights, np.float64
-            )[0]
-            image[:] = render(
-                ResidualCovariance(
-                    pupil, field_source, basis, command_covariance, precise_cross
+                # Rebuild the cross moments for this point before rendering in
+                # float64. The fitted commands and joint covariance can be reused.
+                point = slice(index, index + 1)
+                point_weights = (
+                    None if science_weights is None else science_weights[point]
                 )
-            )
+                precise_cross = phase_command_cross(
+                    batch_directions[point], point_weights, np.float64
+                )[0]
+                image[:] = render(
+                    ResidualCovariance(
+                        pupil, field_source, basis, command_covariance, precise_cross
+                    )
+                )
     return images, pupil.full_flux if optics is None else optics.full_flux

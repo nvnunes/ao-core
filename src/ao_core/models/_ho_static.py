@@ -128,7 +128,15 @@ class OriginalMapOptics:
         )
 
     def image(self, residual, image_side, origin, high_lags=None):
-        coarse = coherence_lags(self.pupil, residual, self.field) / self.coarse_power
+        return self.image_from_lags(
+            coherence_lags(self.pupil, residual, self.field),
+            image_side,
+            origin,
+            high_lags,
+        )
+
+    def image_from_lags(self, lags, image_side, origin, high_lags=None):
+        coarse = lags / self.coarse_power
         coarse = fft.fftshift(fold_lags(coarse, self.pupil.side))
         coarse_factor = None
         native_factor = self.static_lags

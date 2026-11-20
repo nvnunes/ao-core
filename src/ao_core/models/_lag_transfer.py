@@ -5,8 +5,8 @@ from scipy import fft, ndimage
 from scipy.sparse import csr_matrix
 
 
-def cubic_stencil(coordinates, side):
-    """Evaluate periodic cubic spline coefficients at the given coordinates."""
+def cubic_stencil_weights(coordinates, side):
+    """Return the four wrapped coefficient indices and weights for each query."""
     coordinates = coordinates.ravel() % side
     start = np.floor(coordinates).astype(int)
     fraction = coordinates - start
@@ -23,9 +23,16 @@ def cubic_stencil(coordinates, side):
         / 6
     )
     columns = (start[:, None] + np.arange(-1, 3)) % side
+    return columns, weights
+
+
+def cubic_stencil(coordinates, side):
+    """Evaluate periodic cubic spline coefficients at the given coordinates."""
+    columns, weights = cubic_stencil_weights(coordinates, side)
+    count = len(columns)
     return csr_matrix(
-        (weights.ravel(), columns.ravel(), np.arange(0, 4 * len(start) + 1, 4)),
-        shape=(len(start), side),
+        (weights.ravel(), columns.ravel(), np.arange(0, 4 * count + 1, 4)),
+        shape=(count, side),
     )
 
 

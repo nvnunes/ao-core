@@ -25,12 +25,35 @@ from ao_core.models._ho_optics import (
 from ao_core.models._ho_reconstruction import (
     MirrorSurface,
     footprint_shift,
+    fourier_sum,
     gaussian_slopes,
     lenslet_gradient,
     solve_commands,
 )
 from ao_core.models._ho_static import OriginalMapOptics
 from ao_core.models.config import SourceConfig
+
+
+@pytest.mark.parametrize(("count", "size"), [(12, 3), (11, 3), (19, 4)])
+def test_fourier_sum_matches_direct_sum_on_shifted_grid(count, size):
+    rng = np.random.default_rng(31)
+    spectrum = rng.normal(size=(2, count, count)) + 1j * rng.normal(
+        size=(2, count, count)
+    )
+    spacing, step = 0.17, -0.71
+    start = np.array([0.36, -1.23])
+    frequency = (np.arange(count) - count // 2) * spacing
+    expected = np.empty((2, size, size), dtype=complex)
+    for x, y in np.ndindex(size, size):
+        phase = (start[0] + x * step) * frequency[:, None]
+        phase = phase + (start[1] + y * step) * frequency[None, :]
+        expected[:, x, y] = np.sum(spectrum * np.exp(2j * np.pi * phase), axis=(-2, -1))
+    np.testing.assert_allclose(
+        fourier_sum(spectrum, spacing, start, step, size),
+        expected,
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_finite_shifted_lenslet_matches_direct_integration():

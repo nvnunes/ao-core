@@ -141,17 +141,20 @@ def precision_probe_pairs(pupil):
     return np.vstack((near, np.column_stack((first, second))))
 
 
-def phase_pairs_need_float64(pupil, pairs, source, basis, command, cross):
+def phase_pairs_need_float64(
+    pupil, pairs, source, basis, command, cross, *, cross_pairs=None
+):
     """Screen sampled phase differences against a float32 roundoff estimate.
 
     Evaluate only the selected pairs with the prepared float64 arrays. Use
     the magnitudes of the separate covariance contributions so cancellation
     between atmospheric and command terms remains visible in the estimate.
+    With device samples, cross_pairs indexes the gathered cross-moment rows.
     """
     lags, sample_tilt, tilt_covariance = source
     ramps = pupil.ramps.T
 
-    def covariance_terms(left, right):
+    def covariance_terms(left, right, left_cross, right_cross):
         x = (pupil.x[left] - pupil.x[right]) % pupil.side
         y = (pupil.y[left] - pupil.y[right]) % pupil.side
         return np.stack(
@@ -161,15 +164,16 @@ def phase_pairs_need_float64(pupil, pairs, source, basis, command, cross):
                 -np.sum(sample_tilt[:, left].T * ramps[right], axis=1),
                 -np.sum(ramps[left] * sample_tilt[:, right].T, axis=1),
                 np.sum((basis[left] @ command) * basis[right], axis=1),
-                -np.sum(cross[left] * basis[right], axis=1),
-                -np.sum(basis[left] * cross[right], axis=1),
+                -np.sum(cross[left_cross] * basis[right], axis=1),
+                -np.sum(basis[left] * cross[right_cross], axis=1),
             )
         )
 
     left, right = pairs.T
-    left_diag = covariance_terms(left, left)
-    right_diag = covariance_terms(right, right)
-    off_diagonal = covariance_terms(left, right)
+    left_cross, right_cross = (pairs if cross_pairs is None else cross_pairs).T
+    left_diag = covariance_terms(left, left, left_cross, left_cross)
+    right_diag = covariance_terms(right, right, right_cross, right_cross)
+    off_diagonal = covariance_terms(left, right, left_cross, right_cross)
     difference = (left_diag + right_diag - 2 * off_diagonal).sum(axis=0)
     scale = (abs(left_diag) + abs(right_diag) + 2 * abs(off_diagonal)).sum(axis=0)
     return bool(
@@ -191,28 +195,38 @@ class ResidualCovariance:
         *,
         dtype=np.float64,
     ):
-        self.pupil = pupil
-        self.lags, self.sample_tilt, tilt_covariance = (
-            values.astype(dtype, copy=False) for values in source
+        self.side = pupil.side
+        self.x, self.y = pupil.x, pupil.y
+        self.indices = np.arange(len(pupil.x))
+        self._prepare(
+            tuple(values.astype(dtype, copy=False) for values in source),
+            pupil.ramps.astype(dtype, copy=False),
+            basis.astype(dtype, copy=False),
+            command_covariance.astype(dtype, copy=False),
+            source_command.astype(dtype, copy=False),
+            np.einsum,
         )
-        self.ramps = pupil.ramps.astype(dtype, copy=False)
-        self.basis = basis.astype(dtype, copy=False)
-        self.command = self.basis @ command_covariance.astype(dtype, copy=False)
-        self.cross = source_command.astype(dtype, copy=False)
-        self.source_weight = self.ramps.T @ tilt_covariance
-        self.diagonal = np.full(len(basis), self.lags[0, 0])
-        self.diagonal += np.einsum("ij,ij->i", self.source_weight, self.ramps.T)
-        self.diagonal -= 2 * np.einsum("ij,ij->j", self.sample_tilt, self.ramps)
-        self.diagonal += np.einsum("ij,ij->i", self.command, self.basis)
-        self.diagonal -= 2 * np.einsum("ij,ij->i", self.cross, self.basis)
+
+    def _prepare(self, source, ramps, basis, command_covariance, cross, einsum):
+        self.lags, self.sample_tilt, tilt_covariance = source
+        self.ramps = ramps
+        self.basis = basis
+        self.command = basis @ command_covariance
+        self.cross = cross
+        self.source_weight = ramps.T @ tilt_covariance
+        self.diagonal = self.lags[0, 0] + einsum(
+            "ij,ij->i", self.source_weight, ramps.T
+        )
+        self.diagonal -= 2 * einsum("ij,ij->j", self.sample_tilt, ramps)
+        self.diagonal += einsum("ij,ij->i", self.command, basis)
+        self.diagonal -= 2 * einsum("ij,ij->i", cross, basis)
 
     def blocks(self, rows=128):
-        pupil = self.pupil
         for first in range(0, len(self.diagonal), rows):
             left = slice(first, first + rows)
             right = slice(first, None)
-            x = (pupil.x[left, None] - pupil.x[right]) % pupil.side
-            y = (pupil.y[left, None] - pupil.y[right]) % pupil.side
+            x = (self.x[left, None] - self.x[right]) % self.side
+            y = (self.y[left, None] - self.y[right]) % self.side
             values = self.lags[x, y]
             values += self.source_weight[left] @ self.ramps[:, right]
             values -= self.sample_tilt[:, left].T @ self.ramps[:, right]
@@ -220,7 +234,7 @@ class ResidualCovariance:
             values += self.command[left] @ self.basis[right].T
             values -= self.cross[left] @ self.basis[right].T
             values -= self.basis[left] @ self.cross[right].T
-            index = np.arange(len(values))
+            index = self.indices[: len(values)]
             values[index, index] = self.diagonal[left]
             yield first, values
 
@@ -275,13 +289,21 @@ def coherence_lags(pupil, residual, field=None):
         else:
             values = _sum_pairs_by_lag(pair, indices, len(coherence))
         coherence += values + values[::-1].conj()
+    return complete_coherence_lags(
+        pupil, field, coherence, lag_origin, relative_to_static=single
+    )
+
+
+def complete_coherence_lags(pupil, field, coherence, lag_origin, *, relative_to_static):
+    """Restore the analytic zero lag and, for mixed precision, static diffraction."""
+    static_weights = pupil.amplitude if field is None else field
     coherence = coherence.astype(
         np.float64 if field is None else np.complex128, copy=False
     )
     power = pupil.pupil_power if field is None else np.sum(np.abs(field) ** 2)
     coherence[len(coherence) // 2] = power
-    lags = coherence.reshape(lag_shape)
-    if single:
+    lags = coherence.reshape(tuple(1 - 2 * lag_origin))
+    if relative_to_static:
         static_pupil = np.zeros(tuple(1 - lag_origin), dtype=static_weights.dtype)
         static_pupil[pupil.y - pupil.y.min(), pupil.x - pupil.x.min()] = static_weights
         static_lags = _pupil_autocorrelation(static_pupil)

@@ -13,6 +13,7 @@ from scipy.ndimage import affine_transform
 from ao_core.stats import PsfMetadata
 
 from ._ho_common import predict_common
+from ._ho_metal import require_mps
 from ._ho_optics import diffraction_image
 from ._ho_static import static_diffraction
 from ._physical_config import _read_loop, _read_mirrors
@@ -313,18 +314,23 @@ class HoPsfModel:
     ):
         """Select the execution backend and numerical precision.
 
-        CPU execution defaults to float64. The float32 policy uses float32
-        for science DM spline sampling, phase–command slope products, residual
-        covariance blocks and atmospheric pupil-pair integration. The
-        phase–sensor-mean spectral products and inverse FFTs use complex64.
+        CPU defaults to float64. MPS defaults to and requires float32. Metal
+        evaluates the phase–command slope queries and spectral products,
+        assembles residual covariance blocks, and integrates pupil pairs.
+        Mixed precision uses float32 for science DM spline sampling,
+        phase–command slope products, residual covariance blocks and
+        pupil-pair integration. Phase–sensor-mean spectral products and
+        inverse FFTs use complex64.
         Coordinates, reconstruction solves, command covariance assembly,
-        covariance sums across guide stars and atmospheric layers, static
-        diffraction and detector transforms stay float64. Returned PSFs have
-        dtype float64. Mixed-precision execution screens a sample of pupil
-        pairs before image formation. If the probe flags a point or its
+        static diffraction and detector transforms stay float64. The CPU
+        path sums cross moments in float64. On Metal the slope and mean
+        streams are accumulated in float32 and pass directly to pupil
+        integration. Returned PSFs have dtype float64. Mixed-precision
+        execution screens a sample of pupil pairs on the CPU before image
+        formation. If the probe flags a point or its
         float32 render fails a physical check, the model recomputes its
-        cross moments and renders once in float64. A failed float64 check
-        raises an error.
+        cross moments and renders once in float64 on the CPU. A failed
+        float64 check raises an error.
         """
         if backend not in ("cpu", "mps"):
             raise ValueError("HO PSF backend must be 'cpu' or 'mps'")
@@ -335,7 +341,7 @@ class HoPsfModel:
         if backend == "mps":
             if precision != "float32":
                 raise ValueError("HO PSF backend='mps' requires precision='float32'")
-            raise NotImplementedError("HO PSF Metal execution is not yet implemented")
+            require_mps()
         self._backend = backend
         self._precision = precision
 
@@ -422,6 +428,7 @@ class HoPsfModel:
                 int(image_side),
                 phase,
                 dtype=np.dtype(self.precision),
+                backend=self.backend,
             )
         elif phase is None:
             images, full_flux = _diffraction_image(

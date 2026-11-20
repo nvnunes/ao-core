@@ -17,13 +17,21 @@ from .atmosphere import von_karman_spectrum
 
 
 def fourier_sum(spectrum, spacing, start, step, size):
-    """Evaluate a centred frequency square on a translated Cartesian lattice.
+    """Evaluate a centred spectrum on a translated Cartesian lattice.
 
+    Use P3's rectangular products for small output grids. The products and
+    the chirp Z-transform evaluate the same finite Fourier sum.
     See Eqs. (7a)–(7c) for the chirp Z-transform sampling grid.
     [Rabiner et al. (1969)](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/015_czt.pdf)
     """
     count = spectrum.shape[-1]
     modes = np.arange(count) - count // 2
+    if count >= 4 * size:
+        frequency = modes * spacing
+        positions = np.asarray(start)[:, None] + np.arange(size) * step
+        transform = np.exp(2j * np.pi * positions[..., None] * frequency)
+        return (transform[0] @ spectrum) @ transform[1].T
+
     output = spectrum * np.exp(2j * np.pi * spacing * start[0] * modes)[:, None]
     output *= np.exp(2j * np.pi * spacing * start[1] * modes)
     transform = CZT(count, m=size, w=np.exp(2j * np.pi * spacing * step))
@@ -224,13 +232,37 @@ class CovarianceQueries:
             output.dtype, copy=False
         )
         for y, selected, indices in self.blocks:
-            y = y[:, None] + origin[1] - cone_scale * self.cell_y
-            points_y = cubic_stencil(y * self.scale, self.side).astype(
-                output.dtype, copy=False
-            )
+            points_y = self._y_stencil(y, origin[1], cone_scale, output.dtype)
             for direction, kernel in enumerate(kernels):
                 values = points_x @ (points_y @ kernel.T).T
                 output[direction, selected] = values.ravel()[indices]
+
+    def _y_stencil(self, y, offset, cone_scale, dtype):
+        coordinates = y[:, None] + offset - cone_scale * self.cell_y
+        return cubic_stencil(coordinates * self.scale, self.side).astype(
+            dtype, copy=False
+        )
+
+    def evaluate_group(self, kernels, origins, cone_scale, output):
+        """Query contiguous [y, x] planes and reuse identical y passes."""
+        x = self.x[None, :, None] + origins[:, 0, None, None] - cone_scale * self.cell_x
+        matrices = [
+            cubic_stencil(coordinates * self.scale, self.side).astype(
+                output.dtype, copy=False
+            )
+            for coordinates in x
+        ]
+        guides_by_y = {}
+        for guide, offset in enumerate(origins[:, 1]):
+            guides_by_y.setdefault(offset, []).append(guide)
+        for y, selected, indices in self.blocks:
+            for offset, guides in guides_by_y.items():
+                points_y = self._y_stencil(y, offset, cone_scale, output.dtype)
+                for axis, kernel in enumerate(kernels):
+                    columns = np.ascontiguousarray((points_y @ kernel).T)
+                    for guide in guides:
+                        values = matrices[guide] @ columns
+                        output[axis, guide, selected] = values.ravel()[indices]
 
 
 def slope_matrix(values, lenslets):
@@ -369,16 +401,84 @@ def fit_commands(
                 * layer.height
                 * (grid.fx * direction[0] + grid.fy * direction[1])
             )
-        spectra = layer.power * layer.gradient.conj() * field_filter
-        kernels = [
-            ndimage.spline_filter(
-                covariance_kernel(spectrum, grid.kernel_side), mode="grid-wrap"
-            ).astype(dtype, copy=False)
-            for spectrum in spectra
-        ]
+        kernels = _command_kernels(grid, layer, field_filter, dtype)
         for guide, footprint in enumerate(layer.footprints):
             queries.evaluate(kernels, -footprint, layer.cone_scale, sample)
             cross[:, 2 * guide * count : 2 * (guide + 1) * count] += sample.transpose(
                 1, 0, 2
             ).reshape(len(mirror.fit_points), -1)
     return solve_commands(factor, mirror.fit @ cross)
+
+
+def _command_kernels(grid, layer, field_filter, dtype):
+    spectra = layer.power * layer.gradient.conj() * field_filter
+    return [
+        ndimage.spline_filter(
+            covariance_kernel(spectrum, grid.kernel_side), mode="grid-wrap"
+        ).astype(dtype, copy=False)
+        for spectrum in spectra
+    ]
+
+
+class DirectionalCommandFit:
+    """Prepare the science DM prior once and query translated lenslet lags.
+
+    The cached splines and ground-layer cross moments follow the
+    project-authored P3 finiteActuator directional fit. Only one CPU worker
+    uses the scratch array and the ground-layer cache during a prediction.
+    """
+
+    def __init__(self, grid, layers, lenslets, mirror, factor, dtype):
+        self.layers = layers
+        self.mirror = mirror
+        self.factor = factor
+        self.queries = CovarianceQueries(
+            mirror.fit_points, lenslets.cells, grid.kernel_side, grid.period
+        )
+        # The first sparse pass consumes rows in y. Store that orientation
+        # once so SciPy can flatten each plane without a copy on every pass.
+        self.kernels = [
+            [
+                np.ascontiguousarray(kernel.T)
+                for kernel in _command_kernels(grid, layer, 1, dtype)
+            ]
+            for layer in layers
+        ]
+        self.cells = len(lenslets.cells)
+        self.guides = len(lenslets.offsets)
+        self.shape = (len(mirror.fit_points), 2 * self.guides * self.cells)
+        bytes_per_guide = 2 * self.shape[0] * self.cells * np.dtype(dtype).itemsize
+        self.group_size = min(self.guides, max(1, (32 * 1024**2) // bytes_per_guide))
+        self.sample = np.empty(
+            (2, self.group_size, self.shape[0], self.cells), dtype=dtype
+        )
+        self.ground_cross = {}
+
+    def fit_batch(self, directions):
+        return [self._fit(direction) for direction in directions]
+
+    def _fit(self, direction):
+        cross = np.zeros(self.shape)
+        for index, (layer, kernels) in enumerate(
+            zip(self.layers, self.kernels, strict=True)
+        ):
+            if index in self.ground_cross:
+                cross += self.ground_cross[index]
+                continue
+            target = cross if layer.height != 0 else np.zeros_like(cross)
+            origins = layer.height * direction - layer.footprints
+            for first in range(0, self.guides, self.group_size):
+                last = min(first + self.group_size, self.guides)
+                group = self.sample[:, : last - first]
+                self.queries.evaluate_group(
+                    kernels, origins[first:last], layer.cone_scale, group
+                )
+                for guide, values in enumerate(group.swapaxes(0, 1), start=first):
+                    start = 2 * guide * self.cells
+                    target[:, start : start + 2 * self.cells] += values.transpose(
+                        1, 0, 2
+                    ).reshape(self.shape[0], 2 * self.cells)
+            if layer.height == 0:
+                self.ground_cross[index] = target
+                cross += target
+        return solve_commands(self.factor, self.mirror.fit @ cross)

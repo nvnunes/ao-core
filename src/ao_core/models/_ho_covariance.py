@@ -125,6 +125,7 @@ class ScienceCommandQueries:
         self.lenslets = lenslets
         self.pupil = pupil
         self.tilt_modes = tilt_modes
+        self.dtype = np.dtype(dtype)
         self.queries = CovarianceQueries(
             pupil.points, lenslets.cells, grid.kernel_side, grid.period
         )
@@ -132,44 +133,24 @@ class ScienceCommandQueries:
         self.slope_ramps = pupil.ramps.astype(dtype, copy=False)
 
     def slope_kernels(self, layer, transfer):
-        spectra = layer.power * layer.gradient.conj() * np.conj(transfer)
-        kernels = [self._kernel(spectrum) for spectrum in spectra]
-        fit_kernels = [
-            [self._kernel(spectrum * mode) for spectrum in spectra]
-            for mode in self.tilt_modes
-        ]
-        return kernels, fit_kernels
-
-    def _kernel(self, spectrum):
-        return ndimage.spline_filter(
-            covariance_kernel(spectrum, self.grid.kernel_side), mode="grid-wrap"
-        ).astype(self.values.dtype, copy=False)
+        return slope_kernels(
+            layer, transfer, self.tilt_modes, self.grid.kernel_side, self.dtype
+        )
 
     def add_slope_cross(self, result, layer, kernels, footprint, rows, shift=0):
         phase_kernels, fit_kernels = kernels
-        rows = rows.astype(self.values.dtype, copy=False)
+        rows = rows.astype(self.dtype, copy=False)
         lenslets = self.lenslets
         samples = len(lenslets.cells)
         for guide, guide_footprint in enumerate(layer.footprints):
             origin = footprint - guide_footprint - shift
             self.queries.evaluate(phase_kernels, origin, layer.cone_scale, self.values)
             if fit_kernels:
-                lag = (origin - layer.cone_scale * lenslets.cells).T * (
-                    self.grid.kernel_side / self.grid.period
+                lags = origin - layer.cone_scale * lenslets.cells
+                fitted = slope_fit_values(
+                    fit_kernels, lags, self.grid.kernel_side / self.grid.period
                 )
-                for axis, value in enumerate(self.values):
-                    projected = np.array(
-                        [
-                            ndimage.map_coordinates(
-                                kernels[axis],
-                                lag,
-                                order=3,
-                                mode="grid-wrap",
-                                prefilter=False,
-                            )
-                            for kernels in fit_kernels
-                        ]
-                    )
+                for value, projected in zip(self.values, fitted, strict=True):
                     value -= self.slope_ramps.T @ projected
             for axis, value in enumerate(self.values):
                 first = (2 * guide + axis) * samples
@@ -192,6 +173,40 @@ class ScienceCommandQueries:
         return cross
 
 
+def slope_kernels(layer, transfer, tilt_modes, side, dtype):
+    """Prepare periodic spline coefficients for the phase and pupil fit."""
+
+    def prepare(spectrum):
+        return ndimage.spline_filter(
+            covariance_kernel(spectrum, side), mode="grid-wrap"
+        ).astype(dtype, copy=False)
+
+    spectra = layer.power * layer.gradient.conj() * np.conj(transfer)
+    phase = [prepare(spectrum) for spectrum in spectra]
+    fit = [[prepare(spectrum * mode) for spectrum in spectra] for mode in tilt_modes]
+    return phase, fit
+
+
+def slope_fit_values(kernels, lags, scale):
+    """Sample the tilt-fit kernels at lenslet lags with an optional field axis."""
+    coordinates = np.moveaxis(lags, -1, 0) * scale
+    return np.array(
+        [
+            [
+                ndimage.map_coordinates(
+                    fitted[axis],
+                    coordinates,
+                    order=3,
+                    mode="grid-wrap",
+                    prefilter=False,
+                )
+                for fitted in kernels
+            ]
+            for axis in range(2)
+        ]
+    )
+
+
 def science_command(
     grid,
     layers,
@@ -204,8 +219,11 @@ def science_command(
     directions,
     *,
     dtype=np.float64,
+    queries=None,
 ):
     """Contract phase/command cross moments for the requested lines of sight."""
+    if queries is not None:
+        return queries.common_cross(directions, mean_modes)
     queries = ScienceCommandQueries(grid, lenslets, pupil, tilt_modes, dtype=dtype)
     cross = np.zeros((len(directions), len(pupil.points), len(weights)))
     for layer, modes in zip(layers, mean_modes, strict=True):

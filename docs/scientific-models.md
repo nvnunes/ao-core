@@ -125,17 +125,26 @@ execution. It uses float32 for science DM spline sampling, phase–command
 slope products, residual covariance blocks and atmospheric pupil-pair
 integration. The phase–sensor-mean spectral products and inverse FFTs use
 complex64.
-CPU defaults to `precision="float64"`. Both modes use float64 for physical
-coordinates, spline preparation, reconstruction solves, sums across guides
-and atmospheric layers, and two-stage command covariance assembly.
+CPU defaults to `precision="float64"`. Physical coordinates, spline
+preparation, reconstruction solves, and two-stage command covariance
+assembly use float64. CPU execution also sums cross moments in float64.
 Static diffraction, original-map transfer and detector transforms also use
 float64. Before image formation in mixed precision, the model evaluates up
 to 64 pupil-pair phase variances in float64. If a variance falls within
 eight times the estimated float32 roundoff, or if a float32 render fails
 a phase-variance or intensity check, the model recomputes that point's
 cross moments and renders it once in float64. A failed float64 check
-raises an error. The Metal backend is planned and will require
-`precision="float32"`.
+raises an error.
+
+Select `backend="mps"` to run phase–command slope queries and spectral
+products, residual covariance assembly, and pupil-pair integration on
+Metal. MPS defaults to and requires `precision="float32"`. It requires the
+`metal` extra, an available MPS device, and a PyTorch build with Metal
+shader compilation. Metal queries two field points at a time and retains
+phase spline planes within a 512 MiB device cache. Cross moments stay on
+Metal through pupil integration, with only the sampled rows copied for
+the CPU precision check. The CPU also handles spline preparation,
+reconstruction, float64 recomputation, and the final detector transform.
 
 This example uses a resolved INI with nominal DM geometry and no varying
 static OPD. For a configuration with calibrated DM geometry, supply

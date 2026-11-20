@@ -1,10 +1,11 @@
 from dataclasses import replace
+from weakref import ref
 
 import numpy as np
 import pytest
 from astropy import units as u
 
-from ao_core.models import _ho_common, _ho_optics
+from ao_core.models import _ho_common, _ho_metal, _ho_metal_queries, _ho_optics, ho_psf
 from ao_core.models.config import (
     AtmosphereConfig,
     DeformableMirrorConfig,
@@ -65,7 +66,7 @@ def test_refractivity_configuration(config):
         replace(config, relative_humidity=101 * u.percent)
 
 
-def test_model_precision_selection():
+def test_model_precision_selection(monkeypatch):
     default = HoPsfModel()
     assert default.backend == "cpu"
     assert default.precision == "float64"
@@ -80,14 +81,17 @@ def test_model_precision_selection():
         HoPsfModel(precision="float16")
     with pytest.raises(ValueError, match="requires precision='float32'"):
         HoPsfModel(backend="mps", precision="float64")
-    with pytest.raises(NotImplementedError, match="Metal execution"):
+
+    def unavailable():
+        raise RuntimeError("Metal execution unavailable")
+
+    monkeypatch.setattr(ho_psf, "require_mps", unavailable)
+    with pytest.raises(RuntimeError, match="Metal execution unavailable"):
         HoPsfModel(backend="mps")
 
 
-@pytest.mark.parametrize(
-    "route", ["probe", "float64_preflight", "optical_retry", "float64_failure"]
-)
-def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
+@pytest.fixture
+def corrected_config(config, monkeypatch):
     monkeypatch.setattr(_ho_common, "NATIVE_OPTICAL_SIDE", 32)
     common_dm = DeformableMirrorConfig(
         actuator_count=5,
@@ -95,7 +99,7 @@ def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
         influence_model="gaussian",
         influence_coupling=0.25 * u.one,
     )
-    corrected = replace(
+    return replace(
         config,
         telescope=TelescopeConfig(diameter=4 * u.m, zenith_angle=20 * u.deg),
         pupil=Pupil(amplitude=np.ones((8, 8)), pitch=0.5 * u.m),
@@ -122,33 +126,48 @@ def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
         residual_high_order_loop=LoopConfig(gain=1 * u.one, delay_frames=1),
         estimator_regularization=0.1,
     )
-    request = HoPsfRequest(config=corrected)
+
+
+@pytest.mark.parametrize(
+    "route", ["probe", "float64_preflight", "optical_retry", "float64_failure"]
+)
+@pytest.mark.parametrize("backend", ["cpu", "mps"])
+def test_mixed_precision_corrected_prediction(
+    corrected_config, monkeypatch, request, route, backend
+):
+    if backend == "mps":
+        request.getfixturevalue("mps_device")
+    prediction_request = HoPsfRequest(config=corrected_config)
     phase_pairs_need_float64 = _ho_common.phase_pairs_need_float64
     probe_calls = []
 
-    def track_probe(*args):
+    def track_probe(*args, **options):
         probe_calls.append(None)
         if route == "float64_preflight":
             return len(probe_calls) == 1
         if route in ("optical_retry", "float64_failure"):
             return False
-        return phase_pairs_need_float64(*args)
+        return phase_pairs_need_float64(*args, **options)
 
     monkeypatch.setattr(_ho_common, "phase_pairs_need_float64", track_probe)
-    default = HoPsfModel().predict(request)
+    default = HoPsfModel().predict(prediction_request)
     assert not probe_calls
 
     cross_calls = []
     field_cross = _ho_common.TwoStageCovariance.field_cross
 
-    def track_cross(self, *args, dtype):
-        cross = field_cross(self, *args, dtype=dtype)
+    def record_cross(cross, dtype):
         cross_calls.append((np.dtype(dtype).name, len(cross)))
         if route == "float64_failure" or (
-            route == "optical_retry" and dtype == np.float32
+            route == "optical_retry" and len(cross_calls) == 1
         ):
-            cross[0].fill(np.nan)
+            cross[0] = np.nan
         return cross
+
+    def track_cross(self, *args, dtype):
+        if backend == "mps":
+            assert dtype == np.float64
+        return record_cross(field_cross(self, *args, dtype=dtype), dtype)
 
     optical_dtypes = []
     coherence_lags = _ho_optics.coherence_lags
@@ -159,17 +178,36 @@ def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
 
     monkeypatch.setattr(_ho_common.TwoStageCovariance, "field_cross", track_cross)
     monkeypatch.setattr(_ho_optics, "coherence_lags", track_optics)
-    model = HoPsfModel(precision="float32")
+    if backend == "mps":
+        integrate = _ho_metal.MpsPupilOptics.coherence_lags
+        query_type = _ho_metal_queries.MpsScienceCommandQueries
+        contract = query_type.contract_two_stage_cross
+
+        def track_metal_optics(self, *args):
+            optical_dtypes.append("float32")
+            return integrate(self, *args)
+
+        def track_metal_cross(self, *args):
+            cross = contract(self, *args)
+            assert cross.device.type == "mps"
+            return record_cross(cross, np.float32)
+
+        monkeypatch.setattr(query_type, "contract_two_stage_cross", track_metal_cross)
+        monkeypatch.setattr(
+            _ho_metal.MpsPupilOptics, "coherence_lags", track_metal_optics
+        )
+    model = HoPsfModel(backend=backend, precision="float32")
+    first_batch = 2 if backend == "mps" else 3
     if route == "float64_failure":
         with pytest.raises(
             _ho_optics.InvalidCovarianceOptics, match="nonfinite PSF intensity"
         ):
-            model.predict(request)
+            model.predict(prediction_request)
         assert optical_dtypes == ["float32", "float64"]
-        assert cross_calls == [("float32", 3), ("float64", 1)]
+        assert cross_calls == [("float32", first_batch), ("float64", 1)]
         return
 
-    mixed = model.predict(request)
+    mixed = model.predict(prediction_request)
     assert mixed.psfs.dtype == np.float64
     assert mixed.full_flux == default.full_flux
     np.testing.assert_array_equal(mixed.positions, default.positions)
@@ -186,10 +224,234 @@ def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
         "optical_retry": ["float32", "float64", "float32", "float32"],
     }
     assert optical_dtypes == expected_dtypes[route]
-    expected_cross_calls = [("float32", 3)]
+    expected_cross_calls = [("float32", first_batch)]
     if route != "probe":
         expected_cross_calls.append(("float64", 1))
+    if backend == "mps":
+        expected_cross_calls.append(("float32", 1))
     assert cross_calls == expected_cross_calls
+
+
+@pytest.fixture
+def mps_device():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available() or not hasattr(
+        torch.mps, "compile_shader"
+    ):
+        pytest.skip("Metal shader execution is unavailable")
+
+
+@pytest.mark.parametrize("backend", ["cpu", "mps"])
+def test_corrected_prediction_without_tilt_removal(corrected_config, request, backend):
+    if backend == "mps":
+        request.getfixturevalue("mps_device")
+    config = replace(corrected_config, tilt_removal="none")
+    prediction_request = HoPsfRequest(config=config)
+    reference = HoPsfModel().predict(prediction_request)
+    prediction = HoPsfModel(backend=backend, precision="float32").predict(
+        prediction_request
+    )
+    image_error = abs(prediction.psfs - reference.psfs).sum(axis=(1, 2))
+    assert prediction.full_flux == reference.full_flux
+    assert np.all(image_error / reference.full_flux < 1e-4)
+
+
+@pytest.mark.parametrize("correction", ["common-only", "science-dm", "zero-gain"])
+def test_metal_residual_lags(
+    corrected_config, mps_device, monkeypatch, record_property, correction
+):
+    monkeypatch.setattr(_ho_common, "NATIVE_OPTICAL_SIDE", 64)
+    config = replace(
+        corrected_config,
+        pupil=Pupil(amplitude=np.ones((32, 32)), pitch=0.125 * u.m),
+        atmosphere=replace(
+            corrected_config.atmosphere,
+            layer_weights=[0.6, 0.4] * u.one,
+            layer_heights=[4000, 9500] * u.m,
+            wind_speeds=[8, 14] * u.m / u.s,
+            wind_directions=[35, 75] * u.deg,
+        ),
+        high_order_sources=replace(
+            corrected_config.high_order_sources, directions=[[-5, 4], [7, 9]] * u.arcsec
+        ),
+        high_order_lenslets=replace(
+            corrected_config.high_order_lenslets,
+            grid_offsets=[[0.01, -0.02], [0.03, 0.04]] * u.m,
+        ),
+    )
+    mirrors = config.mirrors
+    common_config = replace(config, mirrors=mirrors[:1], residual_high_order_loop=None)
+    if correction == "common-only":
+        config = common_config
+    elif correction == "zero-gain":
+        config = replace(config, residual_high_order_loop=LoopConfig(gain=0 * u.one))
+        # Allow one layer on Metal to exercise eviction and reuse of host planes.
+        monkeypatch.setattr(
+            _ho_metal_queries.MpsScienceCommandQueries,
+            "kernel_cache_bytes",
+            2 * 256**2 * 4,
+        )
+    else:
+        # Exercise complex pupil weights and the original-map detector path.
+        y, x = np.indices(config.pupil.amplitude.shape) - 15.5
+        config = replace(
+            config,
+            pupil=replace(config.pupil, static_opd=x * y * 0.3 * u.nm),
+            static_opd_sampling="original_map",
+            detector_origin="geometric",
+        )
+
+    covariance_errors = []
+    lag_errors = []
+    lag_rms_errors = []
+    cpu_cross = []
+    mps_cross = []
+    probe_samples = []
+    kernel_preparations = []
+    preflight = _ho_common.phase_pairs_need_float64
+    integrate = _ho_metal.MpsPupilOptics.coherence_lags
+    slope_kernels = _ho_metal_queries.slope_kernels
+    kernel_pair = _ho_metal_queries.MpsScienceCommandQueries._kernel_pair
+    upload = _ho_metal_queries.MpsScienceCommandQueries._upload
+
+    def track_cross_moments(
+        pupil, pairs, source, basis, covariance, cross, *, cross_pairs=None
+    ):
+        if cross_pairs is None:
+            cpu_cross.append(cross.copy())
+        else:
+            assert len(cross) < len(pupil.points)
+            probe_samples.append((pairs, cross_pairs, cross))
+        return preflight(
+            pupil, pairs, source, basis, covariance, cross, cross_pairs=cross_pairs
+        )
+
+    def track_slope_kernels(*args):
+        kernel_preparations.append(None)
+        return slope_kernels(*args)
+
+    def check_kernel_budget(queries, index):
+        cache = queries._device_kernels
+        if correction == "zero-gain" and cache and index not in cache:
+            evicted = ref(next(iter(cache.values()))[0][0])
+
+            def check_upload(values, dtype):
+                assert evicted() is None
+                return upload(queries, values, dtype)
+
+            with monkeypatch.context() as scoped:
+                scoped.setattr(queries, "_upload", check_upload)
+                prepared = kernel_pair(queries, index)
+        else:
+            prepared = kernel_pair(queries, index)
+        resident_bytes = sum(
+            phase.numel() * phase.element_size()
+            for layer in cache.values()
+            for phase, _ in layer
+        )
+        assert resident_bytes <= queries.kernel_cache_bytes
+        return prepared
+
+    def compare_lags(optics, source, command_covariance, source_command):
+        assert source_command.device.type == "mps"
+        cross = source_command.cpu().numpy()
+        pairs, cross_pairs, sampled = probe_samples[-1]
+        np.testing.assert_array_equal(sampled[cross_pairs], cross[pairs])
+        mps_cross.append(cross)
+        residual = _ho_optics.ResidualCovariance(
+            optics.pupil,
+            source,
+            optics.basis.cpu().numpy(),
+            command_covariance,
+            cross,
+            dtype=np.float32,
+        )
+        metal = _ho_metal._MpsResidualCovariance(
+            optics, source, command_covariance, source_command
+        )
+        scale = np.max(abs(residual.diagonal))
+        for (_, block), (_, device_block) in zip(
+            residual.blocks(), metal.blocks(), strict=True
+        ):
+            covariance_errors.append(
+                np.max(abs(block - device_block.cpu().numpy())) / scale
+            )
+        cpu = _ho_optics.coherence_lags(optics.pupil, residual, optics.field)
+        mps = integrate(optics, source, command_covariance, source_command)
+        center = tuple(size // 2 for size in cpu.shape)
+        assert mps[center] == cpu[center]
+        np.testing.assert_allclose(
+            mps, mps[::-1, ::-1].conj(), rtol=0, atol=1e-14 * cpu[center].real
+        )
+        lag_errors.append(np.max(abs(mps - cpu)) / cpu[center].real)
+        lag_rms_errors.append(np.linalg.norm(mps - cpu) / np.linalg.norm(cpu))
+        return mps
+
+    monkeypatch.setattr(_ho_metal.MpsPupilOptics, "coherence_lags", compare_lags)
+    monkeypatch.setattr(_ho_common, "phase_pairs_need_float64", track_cross_moments)
+    monkeypatch.setattr(_ho_metal_queries, "slope_kernels", track_slope_kernels)
+    monkeypatch.setattr(
+        _ho_metal_queries.MpsScienceCommandQueries, "_kernel_pair", check_kernel_budget
+    )
+    model = HoPsfModel(backend="mps")
+    assert model.precision == "float32"
+    request = HoPsfRequest(config=config)
+    cpu = HoPsfModel(precision="float32").predict(request)
+    device = model.predict(request)
+    assert device.full_flux == cpu.full_flux
+    assert device.psfs.dtype == np.float64
+    assert len(lag_errors) == len(cpu.positions)
+    assert len(covariance_errors) > len(lag_errors)
+    assert len(kernel_preparations) == (4 if correction == "science-dm" else 2)
+    cpu_moments = np.stack(cpu_cross)
+    mps_moments = np.stack(mps_cross)
+    cross_error = np.max(
+        np.linalg.norm(mps_moments - cpu_moments, axis=(1, 2))
+        / np.linalg.norm(cpu_moments, axis=(1, 2))
+    )
+    image_error = np.max(abs(device.psfs - cpu.psfs).sum(axis=(1, 2)) / cpu.full_flux)
+    record_property("relative_phase_command_cross_error", float(cross_error))
+    record_property("relative_max_covariance_error", float(max(covariance_errors)))
+    record_property("max_lag_error_over_zero_lag", float(max(lag_errors)))
+    record_property("relative_rms_lag_error", float(max(lag_rms_errors)))
+    record_property("image_error_over_full_flux", float(image_error))
+    assert max(covariance_errors) < 1e-5
+    assert max(lag_errors) < 1e-5
+    assert max(lag_rms_errors) < 1e-5
+    assert cross_error < 1e-5
+    assert image_error < 1e-5
+    if correction == "zero-gain":
+        common = model.predict(HoPsfRequest(config=common_config))
+        np.testing.assert_allclose(device.psfs, common.psfs, rtol=1e-5, atol=1e-5)
+
+
+def test_metal_weak_coherence_and_invalid_variance(mps_device):
+    pupil = _ho_optics.OpticalPupil(np.ones((4, 4)), 4, 4, 4, "none")
+    count = len(pupil.x)
+    zero_lags = np.zeros((4, 4))
+    stationary = (zero_lags.copy(), np.empty((0, count)), np.empty((0, 0)))
+    stationary[0][0, 0] = 1e-9
+    basis = np.zeros((count, 1))
+    covariance = np.zeros((1, 1))
+    optics = _ho_metal.MpsPupilOptics(pupil, basis, None)
+    cross = optics.to_device(basis)
+    static = optics.coherence_lags((zero_lags, *stationary[1:]), covariance, cross)
+    residual = _ho_optics.ResidualCovariance(
+        pupil, stationary, basis, covariance, basis, dtype=np.float32
+    )
+    cpu = _ho_optics.coherence_lags(pupil, residual)
+    mps = optics.coherence_lags(stationary, covariance, cross)
+    assert np.max(abs(cpu - static)) > 1e-9
+    np.testing.assert_allclose(mps, cpu, rtol=0, atol=1e-13)
+
+    stationary[0][0, 0] = -1e-3
+    with pytest.raises(_ho_optics.InvalidCovarianceOptics, match="negative difference"):
+        optics.coherence_lags(stationary, covariance, cross)
+    stationary[0][0, 0] = np.nan
+    with pytest.raises(
+        _ho_optics.InvalidCovarianceOptics, match="nonfinite difference"
+    ):
+        optics.coherence_lags(stationary, covariance, cross)
 
 
 @pytest.mark.parametrize("origin, zero", [("fft", 8), ("geometric", 7.5)])

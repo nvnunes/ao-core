@@ -72,7 +72,7 @@ def atmospheric_tail(grid, pupil):
     side = pupil.side
     lags, args, white = _tail_lags(grid, side)
     if len(pupil.tilt_fit) == 0:
-        return lags, np.zeros_like(pupil.ramps.T), np.empty((0, 0))
+        return lags, np.zeros_like(pupil.ramps), np.empty((0, 0))
     count = args[0]
     frequencies = (np.arange(count) - count // 2) * grid.spacing
     waves = np.exp(2j * np.pi * frequencies[:, None] * pupil.fit_axis)

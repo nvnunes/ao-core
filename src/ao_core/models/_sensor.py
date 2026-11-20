@@ -58,7 +58,9 @@ class _CentroidMoments:
                     self.threshold * u.electron,
                     self.nodes,
                 )
-                result = exact._calculate_counts(row[None], jacobian=jacobian)
+                result = exact._calculate_counts(
+                    row[None], jacobian=jacobian, diagnostics=True
+                )
             else:
                 result = self._bright(row, jacobian=jacobian)
             for key, values in answer.items():

@@ -80,7 +80,7 @@ def test_detector_flux_and_conditional_moments_match_pinned_sources(
         np.testing.assert_array_equal(flux.value, np.zeros_like(flux.value))
 
     detector = DirectCentroid(incident, ref["conversion"] * u.mas / u.pix)
-    actual = detector.calculate(flux, jacobian=True)
+    actual = detector.calculate(flux, jacobian=True, diagnostics=True)
     for name, unit in (
         ("mean", u.mas),
         ("covariance", u.mas**2),
@@ -97,7 +97,7 @@ def test_bright_zero_threshold_centroid_converges():
     flux = np.vstack((np.full(25, 10.0), np.linspace(0.0, 9400.0, 25))) * u.photon
     conversion = np.eye(2) * u.mas / u.pix
     detector = DirectCentroid(flux.max(), conversion, threshold=0 * u.electron)
-    actual = detector.calculate(flux, jacobian=True)
+    actual = detector.calculate(flux, jacobian=True, diagnostics=True)
     refined = DirectCentroid(
         flux.max(), conversion, threshold=0 * u.electron, nodes=256
     ).calculate(flux, jacobian=True)
@@ -109,6 +109,33 @@ def test_bright_zero_threshold_centroid_converges():
     for name in ("mean", "covariance", "jacobian"):
         np.testing.assert_allclose(
             actual[name].value, refined[name].value, rtol=1e-8, atol=1e-12
+        )
+
+
+def test_fixed_bright_rule_resolves_thresholded_spot_and_diagnostics_are_opt_in():
+    conversion = np.eye(2) * u.mas / u.pix
+    pattern = np.linspace(0.9, 1.1, 25)
+    flux = np.vstack((pattern * 10.0, pattern * 40.01)) * u.photon
+    bound = 1100 * u.photon
+    detector_settings = {
+        "read_noise": 3 * u.electron,
+        "threshold": 30 * u.electron,
+    }
+    fixed = DirectCentroid(
+        bound, conversion, bright_quadrature="detected_flux", **detector_settings
+    )
+    actual = fixed.calculate(flux, jacobian=True)
+    diagnostic = fixed.calculate(flux, jacobian=True, diagnostics=True)
+    reference = DirectCentroid(
+        bound, conversion, nodes=512, **detector_settings
+    ).calculate(flux, jacobian=True)
+
+    assert "mass_error" not in actual
+    np.testing.assert_allclose(diagnostic["mass_error"].value, 0, atol=1e-9)
+    for name, value in actual.items():
+        np.testing.assert_array_equal(value.value, diagnostic[name].value)
+        np.testing.assert_allclose(
+            value.value, reference[name].value, rtol=1e-7, atol=1e-10
         )
 
 
@@ -690,7 +717,7 @@ def test_bright_clipped_detector_uses_exact_moments_and_empty_response_shape():
     flux = spot.flux(np.zeros(2) * u.mas)
     result = DirectCentroid(
         7000 * u.photon, conversion * u.mas / u.pix, threshold=80 * u.electron
-    ).calculate(flux)
+    ).calculate(flux, diagnostics=True)
     # Paired clipped-normal integration on the half-line for 67.28 photons/pixel.
     np.testing.assert_allclose(result["covariance"].value[0, 0, 0], 2947.28, rtol=3e-6)
     assert np.max(np.abs(result["mass_error"].value)) < 1e-10

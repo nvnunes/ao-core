@@ -16,6 +16,8 @@ from scipy.stats import poisson
 
 from ._units import _count
 
+DETECTED_FLUX_BRIGHT_EXTENT = 128.0
+
 
 def _physical_values(value, unit, name):
     if not isinstance(value, u.Quantity):
@@ -217,9 +219,10 @@ class DirectCentroid:
     other detector settings use the positive half-line. Custom settings
     raise FloatingPointError if the quadrature cannot resolve the centroid
     denominator mass. Choose `bright_quadrature="detected_flux"` to use a
-    finite interval based on the total expected detector photons for every
-    bright row, including custom thresholds. This policy retains the caller's
-    denominator mass diagnostics without automatic fallback.
+    fixed interval [0, 128/F_min] at 1,000 or more expected detector photons,
+    where F_min is the minimum expected detector flux in the bright group.
+    With this policy the probability residual is available as an opt-in
+    diagnostic.
     """
 
     def __init__(
@@ -270,18 +273,21 @@ class DirectCentroid:
         self.differences = tuple(np.diff(x, axis=0) for x in values[:2])
 
     def calculate(
-        self, flux: u.Quantity, *, jacobian: bool = False
+        self, flux: u.Quantity, *, jacobian: bool = False, diagnostics: bool = False
     ) -> dict[str, u.Quantity]:
         """Return thresholded centroid statistics for each supplied detector state.
 
-        The fields are `mean` in mas, `covariance` in mas squared and the
-        dimensionless denominator `mass_error`. If requested, `jacobian`
+        The fields are `mean` in mas and `covariance` in mas squared. With
+        `diagnostics=True`, `mass_error` reports the integrated probability
+        of a nonempty read minus its analytic value. If requested, `jacobian`
         has shape (batch, 25, 2) in mas per expected photon. It differentiates
         the centroid at the selected quadrature nodes and weights. The
         finite-interval calculation holds that interval fixed.
         """
         counts = _physical_values(flux, u.photon, "flux")
-        result = self._calculate_counts(counts, jacobian=jacobian)
+        result = self._calculate_counts(
+            counts, jacobian=jacobian, diagnostics=diagnostics
+        )
         units = {
             "mean": u.mas,
             "covariance": u.mas**2,
@@ -290,7 +296,7 @@ class DirectCentroid:
         }
         return {name: value * units[name] for name, value in result.items()}
 
-    def _calculate_counts(self, flux, *, jacobian=False):
+    def _calculate_counts(self, flux, *, jacobian=False, diagnostics=False):
         if (
             flux.ndim != 2
             or flux.shape[1] != 25
@@ -305,7 +311,7 @@ class DirectCentroid:
             fixed or default_detector or self.threshold == 0.0
         )
         if not bright.any():
-            return self._integrate(flux, jacobian=jacobian)
+            return self._integrate(flux, jacobian=jacobian, diagnostics=diagnostics)
         if self.threshold == 0.0 and not fixed:
             _, clipped_mean, _ = clipped_normal_laplace(
                 self.counts, [0.0], sigma=self.read_noise, threshold=0.0
@@ -314,11 +320,14 @@ class DirectCentroid:
             total[bright] = (probability @ clipped_mean[:, 0]).sum(axis=1)
         levels = np.full(len(flux), -1, dtype=int)
         levels[bright] = np.floor(np.log2(total[bright] / 1000.0)).astype(int)
+        extent = DETECTED_FLUX_BRIGHT_EXTENT if fixed else 64.0
         combined = {}
         for level in np.unique(levels):
             selected = levels == level
-            upper = None if level < 0 else 64.0 / total[selected].min()
-            result = self._integrate(flux[selected], jacobian=jacobian, upper=upper)
+            upper = None if level < 0 else extent / total[selected].min()
+            result = self._integrate(
+                flux[selected], jacobian=jacobian, upper=upper, diagnostics=diagnostics
+            )
             if selected.all():
                 return result
             for name, values in result.items():
@@ -329,7 +338,7 @@ class DirectCentroid:
                 combined[name][selected] = values
         return combined
 
-    def _integrate(self, flux, *, jacobian=False, upper=None):
+    def _integrate(self, flux, *, jacobian=False, upper=None, diagnostics=False):
         """Evaluate the same moment formulas on a half-line or finite interval.
 
         See Eqs. (1.1)–(1.2) for the add-one difference used by the
@@ -372,24 +381,29 @@ class DirectCentroid:
         covariance = raw - np.einsum("bi,bj->bij", mean, mean)
         C = self.conversion
         answer = {"mean": mean @ C.T, "covariance": C[None] @ covariance @ C.T[None]}
-        nonempty = 1 - np.prod(
-            (
-                probability @ ndtr((self.threshold - self.counts) / self.read_noise)
-            ).reshape(flux.shape),
-            axis=1,
-        )
-        mass = np.einsum("bt,bt,t->b", product, ratio.sum(axis=1), weights)
-        answer["mass_error"] = mass - nonempty
-        if (
-            self.bright_quadrature == "auto"
-            and (self.read_noise, self.threshold) != (0.5, 0.5)
-            and np.any(np.abs(answer["mass_error"]) > 1e-8)
-        ):
-            if upper is not None:
-                return self._integrate(flux, jacobian=jacobian)
-            raise FloatingPointError(
-                "Centroid quadrature did not resolve the denominator mass"
+        check_mass = self.bright_quadrature == "auto" and (
+            self.read_noise, self.threshold
+        ) != (0.5, 0.5)
+        if diagnostics or check_mass:
+            # The full integral of E[W exp(-s W)] equals P(W > 0).
+            nonempty = 1 - np.prod(
+                (
+                    probability @ ndtr((self.threshold - self.counts) / self.read_noise)
+                ).reshape(flux.shape),
+                axis=1,
             )
+            mass = np.einsum("bt,bt,t->b", product, ratio.sum(axis=1), weights)
+            mass_error = mass - nonempty
+            if check_mass and np.any(np.abs(mass_error) > 1e-8):
+                if upper is not None:
+                    return self._integrate(
+                        flux, jacobian=jacobian, diagnostics=diagnostics
+                    )
+                raise FloatingPointError(
+                    "Centroid quadrature did not resolve the denominator mass"
+                )
+            if diagnostics:
+                answer["mass_error"] = mass_error
         if jacobian:
             d0, d1 = [(probability @ x).reshape(shape) for x in differences]
             answer["jacobian"] = (

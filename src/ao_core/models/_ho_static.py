@@ -15,6 +15,7 @@ from ._ho_optics import (
     fold_lags,
     image_from_signed_lags,
     sample_pupil_map,
+    validate_detector_intensity,
 )
 from ._ho_reconstruction import fourier_sum
 from ._lag_transfer import CubicLagTransfer
@@ -79,8 +80,9 @@ def _original_detector_image(lags, side, image_side, origin):
     # The centred CZT evaluates the same signed-lag sum as the complete FFT.
     first = image_side / 2 - (0.5 if origin == "geometric" else 0.0)
     image = fourier_sum(lags, 1 / side, np.full(2, first), -1, image_side).real
-    if image.min() < -1e-11 * side**2 * lags[len(lags) // 2, len(lags) // 2].real:
-        raise ValueError("Original-map static transfer produced negative PSF intensity")
+    validate_detector_intensity(
+        image, side**2 * lags[len(lags) // 2, len(lags) // 2].real
+    )
     return image
 
 

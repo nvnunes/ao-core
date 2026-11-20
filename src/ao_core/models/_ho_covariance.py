@@ -120,7 +120,7 @@ def command_moments(grid, layers, lenslets, mirror, weights, measurement_covaria
 class ScienceCommandQueries:
     """Evaluate phase/slopes and phase/sensor-mean cross covariances."""
 
-    def __init__(self, grid, lenslets, pupil, tilt_modes):
+    def __init__(self, grid, lenslets, pupil, tilt_modes, *, dtype=np.float64):
         self.grid = grid
         self.lenslets = lenslets
         self.pupil = pupil
@@ -128,7 +128,8 @@ class ScienceCommandQueries:
         self.queries = CovarianceQueries(
             pupil.points, lenslets.cells, grid.kernel_side, grid.period
         )
-        self.values = np.empty((2, len(pupil.points), len(lenslets.cells)))
+        self.values = np.empty((2, len(pupil.points), len(lenslets.cells)), dtype=dtype)
+        self.slope_ramps = pupil.ramps.astype(dtype, copy=False)
 
     def slope_kernels(self, layer, transfer):
         spectra = layer.power * layer.gradient.conj() * np.conj(transfer)
@@ -142,10 +143,11 @@ class ScienceCommandQueries:
     def _kernel(self, spectrum):
         return ndimage.spline_filter(
             covariance_kernel(spectrum, self.grid.kernel_side), mode="grid-wrap"
-        )
+        ).astype(self.values.dtype, copy=False)
 
     def add_slope_cross(self, result, layer, kernels, footprint, rows, shift=0):
         phase_kernels, fit_kernels = kernels
+        rows = rows.astype(self.values.dtype, copy=False)
         lenslets = self.lenslets
         samples = len(lenslets.cells)
         for guide, guide_footprint in enumerate(layer.footprints):
@@ -168,17 +170,22 @@ class ScienceCommandQueries:
                             for kernels in fit_kernels
                         ]
                     )
-                    value -= self.pupil.ramps.T @ projected
+                    value -= self.slope_ramps.T @ projected
             for axis, value in enumerate(self.values):
                 first = (2 * guide + axis) * samples
                 result += value @ rows[:, first : first + samples].T
 
     def mean_cross(self, layer, modes, footprint):
         grid, pupil = self.grid, self.pupil
+        real_dtype = self.values.dtype
+        complex_dtype = np.result_type(real_dtype, np.complex64)
         phase = np.exp(2j * np.pi * (grid.fx * footprint[0] + grid.fy * footprint[1]))
+        weighted_phase = layer.power.astype(real_dtype, copy=False) * phase.astype(
+            complex_dtype, copy=False
+        )
         cross = np.empty((len(pupil.points), len(modes)))
         for index, mode in enumerate(modes):
-            density = layer.power * phase * mode.conj()
+            density = weighted_phase * mode.astype(complex_dtype, copy=False).conj()
             lag = covariance_kernel(density, pupil.side)
             fitted = np.einsum("ixy,xy->i", self.tilt_modes, density).real
             cross[:, index] = lag[pupil.x_index, pupil.y_index] - pupil.ramps.T @ fitted
@@ -195,9 +202,11 @@ def science_command(
     mean_modes,
     command_means,
     directions,
+    *,
+    dtype=np.float64,
 ):
     """Contract phase/command cross moments for the requested lines of sight."""
-    queries = ScienceCommandQueries(grid, lenslets, pupil, tilt_modes)
+    queries = ScienceCommandQueries(grid, lenslets, pupil, tilt_modes, dtype=dtype)
     cross = np.zeros((len(directions), len(pupil.points), len(weights)))
     for layer, modes in zip(layers, mean_modes, strict=True):
         kernels = queries.slope_kernels(layer, layer.temporal)

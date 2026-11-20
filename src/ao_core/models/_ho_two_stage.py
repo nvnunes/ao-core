@@ -57,6 +57,8 @@ def _stream_covariances(raw, mean_cross, mean_covariance, maps, feedback, gain):
     primary_mean, delayed_mean, product_mean = mean_cross
     common_map, science_mean_map = maps
     # The unprojected delayed residual is h2 * (I - H h1) m.
+    # Keep the products and subtraction in float64 to retain small
+    # residual moments when the streams are strongly correlated.
     free_feedback = free_primary @ feedback.T
     science_slope_covariance = gain**2 * (
         free + (feedback @ primary) @ feedback.T - free_feedback - free_feedback.T
@@ -149,6 +151,7 @@ class TwoStageCovariance:
             feedback,
             gain,
         )
+        # Keep joint command moments in float64 for the optical retry.
         return cls(
             feedback,
             (rows @ common) @ rows.T,
@@ -179,8 +182,10 @@ class TwoStageCovariance:
         science_command_weights,
         directions,
         gain,
+        *,
+        dtype=np.float64,
     ):
-        queries = ScienceCommandQueries(grid, lenslets, pupil, tilt_modes)
+        queries = ScienceCommandQueries(grid, lenslets, pupil, tilt_modes, dtype=dtype)
         common = np.zeros((len(directions), len(pupil.points), len(common_rows)))
         science_cross = np.zeros(
             (len(directions), len(pupil.points), len(science_command_weights[0]))

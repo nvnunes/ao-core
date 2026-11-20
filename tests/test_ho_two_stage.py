@@ -6,8 +6,19 @@ from ao_core.models._ho_atmosphere import PhaseLayer
 from ao_core.models._ho_common import Lenslets
 from ao_core.models._ho_optics import OpticalPupil, ResidualCovariance
 from ao_core.models._ho_reconstruction import gaussian_slopes, lenslet_gradient
-from ao_core.models._ho_two_stage import TwoStageCovariance
+from ao_core.models._ho_two_stage import TwoStageCovariance, _stream_covariances
 from ao_core.models.control import polc_transfer
+
+
+def test_stream_covariance_retains_small_positive_variance_after_cancellation():
+    variance = np.array([[1.00000007]])
+    feedback = np.array([[0.9999]])
+    zero = np.zeros((1, 1))
+    _, science, _ = _stream_covariances(
+        (variance,) * 5, (zero,) * 3, zero, (zero, zero), feedback, 1.0
+    )
+    expected = (1.0 - feedback) ** 2 * variance
+    np.testing.assert_allclose(science, expected, rtol=1e-7, atol=0)
 
 
 def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
@@ -58,7 +69,7 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
         return ((left * power.ravel()) @ right.conj().T).real
 
     unprojected = primary.ravel() * measured
-    result = TwoStageCovariance.prepare(
+    prepare_inputs = (
         grid,
         [layer],
         lenslets,
@@ -67,6 +78,7 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
         covariance(unprojected, unprojected),
         gain,
     )
+    result = TwoStageCovariance.prepare(*prepare_inputs)
     feedback = gaussian_slopes(cells, mirror.centres, mirror.width, 1.0, offsets) @ rows
     average = np.kron(np.eye(4), np.full((3, 3), 1 / 3))
     identity = np.eye(len(measured))
@@ -84,6 +96,7 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
     science_command = science_command_weights @ science_slopes
     command = np.concatenate((common, science_command))
     joint = result.command_covariance(science_command_weights)
+    assert joint.dtype == np.float64
     np.testing.assert_allclose(joint, covariance(command, command), atol=2e-13)
     assert np.linalg.norm(joint[:2, 2:]) > 0.1
 
@@ -97,7 +110,7 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
             + pupil.points[:, 1, None] * fy.ravel()
         )
     )
-    phase_command = result.field_cross(
+    field_inputs = (
         grid,
         [layer],
         lenslets,
@@ -107,13 +120,17 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
         [science_command_weights],
         np.zeros((1, 2)),
         gain,
-    )[0]
+    )
+    phase_command = result.field_cross(*field_inputs)[0]
     np.testing.assert_allclose(
         phase_command[:, :2], covariance(phase, common), atol=2e-13
     )
     np.testing.assert_allclose(
         phase_command[:, 2:], covariance(phase, science_command), atol=2e-13
     )
+    single = result.field_cross(*field_inputs, dtype=np.float32)[0]
+    assert single.dtype == np.float64
+    np.testing.assert_allclose(single, phase_command, rtol=1e-6, atol=2e-7)
 
     basis = rng.normal(size=(len(pupil.points), len(command)))
     residual = ResidualCovariance(

@@ -218,11 +218,16 @@ class CovarianceQueries:
             self.blocks.append((self.y[first:last], selected, indices))
 
     def evaluate(self, kernels, origin, cone_scale, output):
+        """Apply stencils in the dtype shared by the kernels and output."""
         x = self.x[:, None] + origin[0] - cone_scale * self.cell_x
-        points_x = cubic_stencil(x * self.scale, self.side)
+        points_x = cubic_stencil(x * self.scale, self.side).astype(
+            output.dtype, copy=False
+        )
         for y, selected, indices in self.blocks:
             y = y[:, None] + origin[1] - cone_scale * self.cell_y
-            points_y = cubic_stencil(y * self.scale, self.side)
+            points_y = cubic_stencil(y * self.scale, self.side).astype(
+                output.dtype, copy=False
+            )
             for direction, kernel in enumerate(kernels):
                 values = points_x @ (points_y @ kernel.T).T
                 output[direction, selected] = values.ravel()[indices]
@@ -341,7 +346,9 @@ def estimate_commands(
     return commands, temporal, factor
 
 
-def fit_commands(grid, layers, lenslets, mirror, directions, weights, factor):
+def fit_commands(
+    grid, layers, lenslets, mirror, directions, weights, factor, *, dtype=np.float64
+):
     """Fit the weighted phase across directions using the factored slope prior.
 
     See Eq. (5) for the underlying covariance regression. The
@@ -352,7 +359,7 @@ def fit_commands(grid, layers, lenslets, mirror, directions, weights, factor):
     )
     count = len(lenslets.cells)
     cross = np.zeros((len(mirror.fit_points), 2 * len(lenslets.offsets) * count))
-    sample = np.empty((2, len(mirror.fit_points), count))
+    sample = np.empty((2, len(mirror.fit_points), count), dtype=dtype)
     for layer in layers:
         field_filter = np.zeros_like(grid.fx, dtype=complex)
         for direction, weight in zip(directions, weights, strict=True):
@@ -366,7 +373,7 @@ def fit_commands(grid, layers, lenslets, mirror, directions, weights, factor):
         kernels = [
             ndimage.spline_filter(
                 covariance_kernel(spectrum, grid.kernel_side), mode="grid-wrap"
-            )
+            ).astype(dtype, copy=False)
             for spectrum in spectra
         ]
         for guide, footprint in enumerate(layer.footprints):

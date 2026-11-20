@@ -14,7 +14,14 @@ from ao_core.models._ho_atmosphere import (
     science_azimuths,
 )
 from ao_core.models._ho_covariance import projected_modes
-from ao_core.models._ho_optics import OpticalPupil, ResidualCovariance, coherence_image
+from ao_core.models._ho_optics import (
+    InvalidCovarianceOptics,
+    OpticalPupil,
+    ResidualCovariance,
+    coherence_image,
+    phase_pairs_need_float64,
+    precision_probe_pairs,
+)
 from ao_core.models._ho_reconstruction import (
     MirrorSurface,
     footprint_shift,
@@ -136,17 +143,23 @@ def test_blocked_covariance_matches_direct_residual_phase(apply_commands):
 
 
 @pytest.mark.parametrize("origin,offset", [("fft", 0.0), ("geometric", 0.5)])
-def test_pair_coherence_matches_direct_optical_sum(origin, offset):
+@pytest.mark.parametrize("dtype, tolerance", [(np.float64, 1e-13), (np.float32, 2e-7)])
+def test_pair_coherence_matches_direct_optical_sum(origin, offset, dtype, tolerance):
     pupil = OpticalPupil(
         np.array([[0.0, 1, 0], [1, 1, 0.6], [0, 1, 0]]), 3.0, 4.0, 4, "pupil_fit"
     )
     power = np.diag([0.2, 0.3, 0.4, 0.3])
     moments = pupil.stationary_moments(power, pupil.fit_modes(4))
     count = len(pupil.points)
-    residual = ResidualCovariance(
-        pupil, moments, np.zeros((count, 1)), np.zeros((1, 1)), np.zeros((count, 1))
+    inputs = (
+        pupil,
+        moments,
+        np.zeros((count, 1)),
+        np.zeros((1, 1)),
+        np.zeros((count, 1)),
     )
-    _, covariance = next(residual.blocks())
+    residual = ResidualCovariance(*inputs, dtype=dtype)
+    _, covariance = next(ResidualCovariance(*inputs).blocks())
     structure = np.diag(covariance)[:, None] + np.diag(covariance) - 2 * covariance
     coherence = np.exp(-0.5 * structure) * pupil.amplitude[:, None] * pupil.amplitude
     azimuth = np.arange(4) - 2 + offset
@@ -154,8 +167,73 @@ def test_pair_coherence_matches_direct_optical_sum(origin, offset):
     wave = np.exp(-2j * np.pi * field @ pupil.points.T / 4)
     direct = np.einsum("ij,jk,ik->i", wave, coherence, wave.conj()).real.reshape(4, 4)
     image = coherence_image(pupil, residual, 4, origin)
-    np.testing.assert_allclose(image, direct, atol=1e-13)
+    assert next(residual.blocks())[1].dtype == dtype
+    assert image.dtype == np.float64
+    np.testing.assert_allclose(
+        image / pupil.full_flux, direct / pupil.full_flux, rtol=0, atol=tolerance
+    )
     assert image.sum() == pytest.approx(pupil.full_flux)
+
+
+def test_float32_pair_integration_preserves_the_diffraction_limit():
+    pupil = OpticalPupil(np.full((8, 8), 0.8793), 8.0, 16.0, 16, "none")
+    count = len(pupil.points)
+    moments = (np.zeros((16, 16)), np.zeros((0, count)), np.zeros((0, 0)))
+    basis = np.zeros((count, 1))
+    inputs = pupil, moments, basis, np.zeros((1, 1)), basis
+    assert not phase_pairs_need_float64(
+        pupil, precision_probe_pairs(pupil), *inputs[1:]
+    )
+    reference = coherence_image(pupil, ResidualCovariance(*inputs), 16, "fft")
+    actual = coherence_image(
+        pupil, ResidualCovariance(*inputs, dtype=np.float32), 16, "fft"
+    )
+    np.testing.assert_allclose(actual, reference, atol=1e-11, rtol=0)
+    assert actual.sum() == pytest.approx(pupil.full_flux)
+
+
+@pytest.mark.parametrize(
+    "scale,message",
+    [(1e-5, "negative difference variance"), (1e-3, "negative PSF intensity")],
+)
+def test_near_diffraction_probe_flags_covariance_that_requires_float64(scale, message):
+    pupil = OpticalPupil(np.ones((8, 8)), 8.0, 16.0, 16, "none")
+    count = len(pupil.points)
+    source = (np.zeros((16, 16)), np.zeros((0, count)), np.zeros((0, 0)))
+    basis = np.exp(-scale * np.sum(pupil.points**2, axis=1))[:, None]
+    inputs = pupil, source, basis, np.ones((1, 1)), np.zeros_like(basis)
+    assert phase_pairs_need_float64(pupil, precision_probe_pairs(pupil), *inputs[1:])
+    image = coherence_image(pupil, ResidualCovariance(*inputs), 16, "fft")
+    assert image.sum() == pytest.approx(pupil.full_flux)
+    residual = ResidualCovariance(*inputs, dtype=np.float32)
+    with pytest.raises(InvalidCovarianceOptics, match=message):
+        coherence_image(pupil, residual, 16, "fft")
+    invalid = ResidualCovariance(
+        pupil, source, basis, -np.ones((1, 1)), np.zeros_like(basis)
+    )
+    with pytest.raises(InvalidCovarianceOptics, match="negative difference variance"):
+        coherence_image(pupil, invalid, 16, "fft")
+
+
+@pytest.mark.parametrize("image_side", [8, 16])
+def test_original_map_near_rank_one_command_covariance_requires_float64(
+    image_side,
+):
+    amplitude = np.ones((8, 8))
+    pupil = OpticalPupil(amplitude, 8.0, 16.0, 16, "none")
+    optics = OriginalMapOptics(pupil, amplitude, np.zeros_like(amplitude), 1.0, 16)
+    count = len(pupil.points)
+    source = (np.zeros((16, 16)), np.zeros((0, count)), np.zeros((0, 0)))
+    weight = np.linspace(0, 1, count)
+    basis = np.column_stack((weight, 1 - weight))
+    commands = np.array([1.0, 1.00000006])
+    inputs = pupil, source, basis, np.outer(commands, commands), np.zeros_like(basis)
+    assert phase_pairs_need_float64(pupil, precision_probe_pairs(pupil), *inputs[1:])
+    image = optics.image(ResidualCovariance(*inputs), image_side, "fft")
+    centre = image_side // 2
+    assert image[centre, centre] == pytest.approx(amplitude.sum() ** 2)
+    with pytest.raises(InvalidCovarianceOptics, match="negative difference variance"):
+        optics.image(ResidualCovariance(*inputs, dtype=np.float32), image_side, "fft")
 
 
 def test_chromatic_limits_and_directly_translated_mode():
@@ -199,7 +277,10 @@ def test_refractivity_at_mathar_reference_conditions():
     )
 
 
-def test_original_map_matches_nonstationary_pairs_when_the_grid_resolves_it():
+@pytest.mark.parametrize("dtype, tolerance", [(np.float64, 3e-14), (np.float32, 2e-7)])
+def test_original_map_matches_nonstationary_pairs_when_the_grid_resolves_it(
+    dtype, tolerance
+):
     y, x = np.indices((16, 16))
     radius = (x - 7.5) ** 2 + (y - 7.5) ** 2
     amplitude = ((radius < 49) & (radius > 4)).astype(float)
@@ -211,7 +292,7 @@ def test_original_map_matches_nonstationary_pairs_when_the_grid_resolves_it():
     )
     stationary = (np.zeros((64, 64)), np.zeros_like(pupil.ramps), np.zeros((2, 2)))
     residual = ResidualCovariance(
-        pupil, stationary, basis, np.eye(2), np.zeros_like(basis)
+        pupil, stationary, basis, np.eye(2), np.zeros_like(basis), dtype=dtype
     )
     image = optics.image(residual, 64, "fft")
     ramps = np.stack((x - 7.5, y - 7.5), axis=-1) / 8
@@ -229,7 +310,7 @@ def test_original_map_matches_nonstationary_pairs_when_the_grid_resolves_it():
         "ij,jk,ik->i", wave, coherence, wave.conj(), optimize=True
     ).real.reshape(64, 64)
     np.testing.assert_allclose(
-        image / optics.full_flux, direct / optics.full_flux, atol=3e-14
+        image / optics.full_flux, direct / optics.full_flux, atol=tolerance
     )
 
 

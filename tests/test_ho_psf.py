@@ -4,11 +4,13 @@ import numpy as np
 import pytest
 from astropy import units as u
 
+from ao_core.models import _ho_common, _ho_optics
 from ao_core.models.config import (
     AtmosphereConfig,
     DeformableMirrorConfig,
     DetectorConfig,
     FittingConfig,
+    LensletConfig,
     LoopConfig,
     Pupil,
     SourceConfig,
@@ -61,6 +63,133 @@ def test_refractivity_configuration(config):
     assert compatible.ciddor_compressibility is False
     with pytest.raises(ValueError, match="relative_humidity"):
         replace(config, relative_humidity=101 * u.percent)
+
+
+def test_model_precision_selection():
+    default = HoPsfModel()
+    assert default.backend == "cpu"
+    assert default.precision == "float64"
+    assert HoPsfModel(backend="cpu", precision="float32").precision == "float32"
+    with pytest.raises(AttributeError):
+        default.backend = "mps"
+    with pytest.raises(AttributeError):
+        default.precision = "float16"
+    with pytest.raises(ValueError, match="backend must be"):
+        HoPsfModel(backend="cuda")
+    with pytest.raises(ValueError, match="precision must be"):
+        HoPsfModel(precision="float16")
+    with pytest.raises(ValueError, match="requires precision='float32'"):
+        HoPsfModel(backend="mps", precision="float64")
+    with pytest.raises(NotImplementedError, match="Metal execution"):
+        HoPsfModel(backend="mps")
+
+
+@pytest.mark.parametrize(
+    "route", ["probe", "float64_preflight", "optical_retry", "float64_failure"]
+)
+def test_mixed_precision_corrected_prediction(config, monkeypatch, route):
+    monkeypatch.setattr(_ho_common, "NATIVE_OPTICAL_SIDE", 32)
+    common_dm = DeformableMirrorConfig(
+        actuator_count=5,
+        pitch=1 * u.m,
+        influence_model="gaussian",
+        influence_coupling=0.25 * u.one,
+    )
+    corrected = replace(
+        config,
+        telescope=TelescopeConfig(diameter=4 * u.m, zenith_angle=20 * u.deg),
+        pupil=Pupil(amplitude=np.ones((8, 8)), pitch=0.5 * u.m),
+        atmosphere=AtmosphereConfig(
+            reference_wavelength=500 * u.nm,
+            fried_parameter=0.15 * u.m,
+            outer_scale=25 * u.m,
+            layer_weights=[1] * u.one,
+            layer_heights=[4000] * u.m,
+            wind_speeds=[8] * u.m / u.s,
+            wind_directions=[35] * u.deg,
+        ),
+        high_order_sources=SourceConfig(
+            directions=[[0, 0]] * u.arcsec,
+            height=90 * u.km,
+            wavelengths=[589] * u.nm,
+        ),
+        high_order_lenslets=LensletConfig(pitches=[1] * u.m, counts=(4,)),
+        fitting=FittingConfig(directions=[[0, 0]] * u.arcsec, weights=[1] * u.one),
+        mirrors=(common_dm, common_dm),
+        high_order_loop=LoopConfig(
+            gain=0.3 * u.one, frame_rate=500 * u.Hz, delay_frames=2
+        ),
+        residual_high_order_loop=LoopConfig(gain=1 * u.one, delay_frames=1),
+        estimator_regularization=0.1,
+    )
+    request = HoPsfRequest(config=corrected)
+    phase_pairs_need_float64 = _ho_common.phase_pairs_need_float64
+    probe_calls = []
+
+    def track_probe(*args):
+        probe_calls.append(None)
+        if route == "float64_preflight":
+            return len(probe_calls) == 1
+        if route in ("optical_retry", "float64_failure"):
+            return False
+        return phase_pairs_need_float64(*args)
+
+    monkeypatch.setattr(_ho_common, "phase_pairs_need_float64", track_probe)
+    default = HoPsfModel().predict(request)
+    assert not probe_calls
+
+    cross_calls = []
+    field_cross = _ho_common.TwoStageCovariance.field_cross
+
+    def track_cross(self, *args, dtype):
+        cross = field_cross(self, *args, dtype=dtype)
+        cross_calls.append((np.dtype(dtype).name, len(cross)))
+        if route == "float64_failure" or (
+            route == "optical_retry" and dtype == np.float32
+        ):
+            cross[0].fill(np.nan)
+        return cross
+
+    optical_dtypes = []
+    coherence_lags = _ho_optics.coherence_lags
+
+    def track_optics(pupil, residual, field):
+        optical_dtypes.append(residual.diagonal.dtype.name)
+        return coherence_lags(pupil, residual, field)
+
+    monkeypatch.setattr(_ho_common.TwoStageCovariance, "field_cross", track_cross)
+    monkeypatch.setattr(_ho_optics, "coherence_lags", track_optics)
+    model = HoPsfModel(precision="float32")
+    if route == "float64_failure":
+        with pytest.raises(
+            _ho_optics.InvalidCovarianceOptics, match="nonfinite PSF intensity"
+        ):
+            model.predict(request)
+        assert optical_dtypes == ["float32", "float64"]
+        assert cross_calls == [("float32", 3), ("float64", 1)]
+        return
+
+    mixed = model.predict(request)
+    assert mixed.psfs.dtype == np.float64
+    assert mixed.full_flux == default.full_flux
+    np.testing.assert_array_equal(mixed.positions, default.positions)
+    assert np.isfinite(mixed.psfs).all()
+    relative_image_error = (
+        np.abs(mixed.psfs - default.psfs).sum(axis=(1, 2)) / default.full_flux
+    )
+    assert np.all(relative_image_error < 1e-4)
+    assert np.all(relative_image_error[1:] > 0)
+    assert len(probe_calls) == 3
+    expected_dtypes = {
+        "probe": ["float32", "float32", "float32"],
+        "float64_preflight": ["float64", "float32", "float32"],
+        "optical_retry": ["float32", "float64", "float32", "float32"],
+    }
+    assert optical_dtypes == expected_dtypes[route]
+    expected_cross_calls = [("float32", 3)]
+    if route != "probe":
+        expected_cross_calls.append(("float64", 1))
+    assert cross_calls == expected_cross_calls
 
 
 @pytest.mark.parametrize("origin, zero", [("fft", 8), ("geometric", 7.5)])

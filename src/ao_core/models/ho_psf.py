@@ -192,8 +192,8 @@ class HoPsfPrediction(_PhysicalRecord):
 
     Attributes:
         positions: Read-only Cartesian field coordinates as angular x/y pairs.
-        psfs: Read-only image cube in [field, y, x] order. The initial model
-            returns float64 pixels. Columns increase toward +x and rows toward +y.
+        psfs: Read-only float64 image cube in [field, y, x] order. Columns
+            increase toward +x and rows toward +y.
         metadata: Wavelength, pixel scale, telescope diameter and pupil.
         full_flux: Shared positive integral of the uncropped sampled plane
             in native pixel units. Divide `psfs` by this value for unit
@@ -305,6 +305,50 @@ def _diffraction_image(amplitude, pupil_pitch, period, image_side, detector_orig
 class HoPsfModel:
     """Predict high-order PSFs from a resolved optical configuration."""
 
+    def __init__(
+        self,
+        *,
+        backend: Literal["cpu", "mps"] = "cpu",
+        precision: Literal["float64", "float32"] | None = None,
+    ):
+        """Select the execution backend and numerical precision.
+
+        CPU execution defaults to float64. The float32 policy uses float32
+        for science DM spline sampling, phase–command slope products, residual
+        covariance blocks and atmospheric pupil-pair integration. The
+        phase–sensor-mean spectral products and inverse FFTs use complex64.
+        Coordinates, reconstruction solves, command covariance assembly,
+        covariance sums across guide stars and atmospheric layers, static
+        diffraction and detector transforms stay float64. Returned PSFs have
+        dtype float64. Mixed-precision execution screens a sample of pupil
+        pairs before image formation. If the probe flags a point or its
+        float32 render fails a physical check, the model recomputes its
+        cross moments and renders once in float64. A failed float64 check
+        raises an error.
+        """
+        if backend not in ("cpu", "mps"):
+            raise ValueError("HO PSF backend must be 'cpu' or 'mps'")
+        if precision is None:
+            precision = "float32" if backend == "mps" else "float64"
+        if precision not in ("float64", "float32"):
+            raise ValueError("HO PSF precision must be 'float64' or 'float32'")
+        if backend == "mps":
+            if precision != "float32":
+                raise ValueError("HO PSF backend='mps' requires precision='float32'")
+            raise NotImplementedError("HO PSF Metal execution is not yet implemented")
+        self._backend = backend
+        self._precision = precision
+
+    @property
+    def backend(self) -> Literal["cpu", "mps"]:
+        """The resolved execution backend."""
+        return self._backend
+
+    @property
+    def precision(self) -> Literal["float64", "float32"]:
+        """The resolved numerical precision policy."""
+        return self._precision
+
     def predict(self, request: HoPsfRequest) -> HoPsfPrediction:
         """Evaluate the field at one wavelength on the configured detector.
 
@@ -377,6 +421,7 @@ class HoPsfModel:
                 wavelength.to_value(u.m),
                 int(image_side),
                 phase,
+                dtype=np.dtype(self.precision),
             )
         elif phase is None:
             images, full_flux = _diffraction_image(

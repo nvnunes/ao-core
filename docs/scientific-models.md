@@ -120,6 +120,23 @@ grid and returns `float64` images. Divide `prediction.psfs` by the shared
 `prediction.full_flux` to express intensities as fractions of the total
 uncropped flux.
 
+Use `HoPsfModel(backend="cpu", precision="float32")` for mixed-precision
+execution. It uses float32 for science DM spline sampling, phase–command
+slope products, residual covariance blocks and atmospheric pupil-pair
+integration. The phase–sensor-mean spectral products and inverse FFTs use
+complex64.
+CPU defaults to `precision="float64"`. Both modes use float64 for physical
+coordinates, spline preparation, reconstruction solves, sums across guides
+and atmospheric layers, and two-stage command covariance assembly.
+Static diffraction, original-map transfer and detector transforms also use
+float64. Before image formation in mixed precision, the model evaluates up
+to 64 pupil-pair phase variances in float64. If a variance falls within
+eight times the estimated float32 roundoff, or if a float32 render fails
+a phase-variance or intensity check, the model recomputes that point's
+cross moments and renders it once in float64. A failed float64 check
+raises an error. The Metal backend is planned and will require
+`precision="float32"`.
+
 This example uses a resolved INI with nominal DM geometry and no varying
 static OPD. For a configuration with calibrated DM geometry, supply
 `mirror_geometries` before prediction. [Model configuration](model-configuration.md)

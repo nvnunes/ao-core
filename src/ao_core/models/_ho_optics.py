@@ -13,11 +13,18 @@ from .optics import (
     _coherence_from_variance_buffer,
     _image_from_otf,
     _phase_difference_variance_inplace,
+    _pupil_autocorrelation,
     _sum_pairs_by_lag,
 )
 from .pupil import _pupil_tilt_fit
 
 NATIVE_OPTICAL_SIDE = 512
+_PROBE_PAIRS_PER_GROUP = 32
+_FLOAT32_ROUNDOFF_MARGIN = 8 * (np.finfo(np.float32).eps / 2)
+
+
+class InvalidCovarianceOptics(ValueError):
+    """The residual covariance failed a physical check during image formation."""
 
 
 def sample_pupil_map(values, width):
@@ -109,21 +116,95 @@ class OpticalPupil:
         return lags, cross, tilt
 
 
+def precision_probe_pairs(pupil):
+    """Sample neighbouring and wider pupil pairs once per optical grid."""
+    points = list(zip(pupil.x, pupil.y, strict=True))
+    if len(points) < 2:
+        return np.empty((0, 2), dtype=int)
+
+    by_coordinate = {point: index for index, point in enumerate(points)}
+    neighbours = [
+        (index, by_coordinate[neighbour])
+        for index, (x, y) in enumerate(points)
+        for neighbour in ((x + 1, y), (x, y + 1))
+        if neighbour in by_coordinate
+    ]
+    near = np.asarray(neighbours, dtype=int).reshape(-1, 2)
+    if len(near) > _PROBE_PAIRS_PER_GROUP:
+        near = near[np.linspace(0, len(near) - 1, _PROBE_PAIRS_PER_GROUP, dtype=int)]
+
+    rng = np.random.default_rng(1729)
+    first = rng.integers(len(points), size=_PROBE_PAIRS_PER_GROUP)
+    second = (first + rng.integers(1, len(points), size=_PROBE_PAIRS_PER_GROUP)) % len(
+        points
+    )
+    return np.vstack((near, np.column_stack((first, second))))
+
+
+def phase_pairs_need_float64(pupil, pairs, source, basis, command, cross):
+    """Screen sampled phase differences against a float32 roundoff estimate.
+
+    Evaluate only the selected pairs with the prepared float64 arrays. Use
+    the magnitudes of the separate covariance contributions so cancellation
+    between atmospheric and command terms remains visible in the estimate.
+    """
+    lags, sample_tilt, tilt_covariance = source
+    ramps = pupil.ramps.T
+
+    def covariance_terms(left, right):
+        x = (pupil.x[left] - pupil.x[right]) % pupil.side
+        y = (pupil.y[left] - pupil.y[right]) % pupil.side
+        return np.stack(
+            (
+                lags[x, y],
+                np.sum((ramps[left] @ tilt_covariance) * ramps[right], axis=1),
+                -np.sum(sample_tilt[:, left].T * ramps[right], axis=1),
+                -np.sum(ramps[left] * sample_tilt[:, right].T, axis=1),
+                np.sum((basis[left] @ command) * basis[right], axis=1),
+                -np.sum(cross[left] * basis[right], axis=1),
+                -np.sum(basis[left] * cross[right], axis=1),
+            )
+        )
+
+    left, right = pairs.T
+    left_diag = covariance_terms(left, left)
+    right_diag = covariance_terms(right, right)
+    off_diagonal = covariance_terms(left, right)
+    difference = (left_diag + right_diag - 2 * off_diagonal).sum(axis=0)
+    scale = (abs(left_diag) + abs(right_diag) + 2 * abs(off_diagonal)).sum(axis=0)
+    return bool(
+        np.any(~np.isfinite(difference) | ~np.isfinite(scale))
+        or np.any((scale > 0) & (difference <= _FLOAT32_ROUNDOFF_MARGIN * scale))
+    )
+
+
 class ResidualCovariance:
     """Return bounded upper strips of a complete science phase covariance."""
 
-    def __init__(self, pupil, source, basis, command_covariance, source_command):
+    def __init__(
+        self,
+        pupil,
+        source,
+        basis,
+        command_covariance,
+        source_command,
+        *,
+        dtype=np.float64,
+    ):
         self.pupil = pupil
-        self.lags, self.sample_tilt, self.tilt_covariance = source
-        self.basis = basis
-        self.command = basis @ command_covariance
-        self.cross = source_command
-        self.source_weight = pupil.ramps.T @ self.tilt_covariance
+        self.lags, self.sample_tilt, tilt_covariance = (
+            values.astype(dtype, copy=False) for values in source
+        )
+        self.ramps = pupil.ramps.astype(dtype, copy=False)
+        self.basis = basis.astype(dtype, copy=False)
+        self.command = self.basis @ command_covariance.astype(dtype, copy=False)
+        self.cross = source_command.astype(dtype, copy=False)
+        self.source_weight = self.ramps.T @ tilt_covariance
         self.diagonal = np.full(len(basis), self.lags[0, 0])
-        self.diagonal += np.einsum("ij,ij->i", self.source_weight, pupil.ramps.T)
-        self.diagonal -= 2 * np.einsum("ij,ij->j", self.sample_tilt, pupil.ramps)
-        self.diagonal += np.einsum("ij,ij->i", self.command, basis)
-        self.diagonal -= 2 * np.einsum("ij,ij->i", self.cross, basis)
+        self.diagonal += np.einsum("ij,ij->i", self.source_weight, self.ramps.T)
+        self.diagonal -= 2 * np.einsum("ij,ij->j", self.sample_tilt, self.ramps)
+        self.diagonal += np.einsum("ij,ij->i", self.command, self.basis)
+        self.diagonal -= 2 * np.einsum("ij,ij->i", self.cross, self.basis)
 
     def blocks(self, rows=128):
         pupil = self.pupil
@@ -133,9 +214,9 @@ class ResidualCovariance:
             x = (pupil.x[left, None] - pupil.x[right]) % pupil.side
             y = (pupil.y[left, None] - pupil.y[right]) % pupil.side
             values = self.lags[x, y]
-            values += self.source_weight[left] @ pupil.ramps[:, right]
-            values -= self.sample_tilt[:, left].T @ pupil.ramps[:, right]
-            values -= pupil.ramps[:, left].T @ self.sample_tilt[:, right]
+            values += self.source_weight[left] @ self.ramps[:, right]
+            values -= self.sample_tilt[:, left].T @ self.ramps[:, right]
+            values -= self.ramps[:, left].T @ self.sample_tilt[:, right]
             values += self.command[left] @ self.basis[right].T
             values -= self.cross[left] @ self.basis[right].T
             values -= self.basis[left] @ self.cross[right].T
@@ -154,9 +235,12 @@ def coherence_lags(pupil, residual, field=None):
         [pupil.y.min() - pupil.y.max(), pupil.x.min() - pupil.x.max()]
     )
     lag_shape = tuple(1 - 2 * lag_origin)
-    coherence = np.zeros(
-        np.prod(lag_shape), dtype=np.float64 if field is None else np.complex128
-    )
+    dtype = residual.diagonal.dtype
+    single = dtype == np.float32
+    static_weights = pupil.amplitude if field is None else field
+    weights_dtype = dtype if field is None else np.result_type(dtype, np.complex64)
+    weights = static_weights.astype(weights_dtype, copy=False)
+    coherence = np.zeros(np.prod(lag_shape), dtype=weights.dtype)
     for first, pair in residual.blocks():
         end = first + len(pair)
         rows = slice(first, end)
@@ -165,22 +249,45 @@ def coherence_lags(pupil, residual, field=None):
         )
         upper = np.arange(first, len(pupil.x)) >= np.arange(first, end)[:, None]
         if np.any(pair[upper] < -1e-8):
-            raise ValueError("A residual phase pair has negative difference variance")
+            raise InvalidCovarianceOptics(
+                "A residual phase pair has negative difference variance"
+            )
         np.maximum(pair, 0, out=pair)
-        pair = _coherence_from_variance_buffer(pair)
-        if field is None:
-            pair *= pupil.amplitude[rows, None]
-            pair *= pupil.amplitude[first:]
+        if single:
+            # Integrate the atmospheric change from exact static diffraction.
+            # This preserves diffraction zeros in the weak-turbulence limit.
+            pair *= -0.5
+            np.expm1(pair, out=pair)
         else:
-            pair = pair * field[rows, None] * field[first:].conj()
+            pair = _coherence_from_variance_buffer(pair)
+        if field is None:
+            pair *= weights[rows, None]
+            pair *= weights[first:]
+        else:
+            pair = pair * weights[rows, None] * weights[first:].conj()
         pair[~upper] = 0
         y = pupil.y[rows, None] - pupil.y[first:] - lag_origin[0]
         x = pupil.x[rows, None] - pupil.x[first:] - lag_origin[1]
-        values = _sum_pairs_by_lag(pair, (y * lag_shape[1] + x).ravel(), len(coherence))
+        indices = (y * lag_shape[1] + x).ravel()
+        if single:
+            values = np.zeros_like(coherence)
+            np.add.at(values, indices, pair.ravel())
+        else:
+            values = _sum_pairs_by_lag(pair, indices, len(coherence))
         coherence += values + values[::-1].conj()
+    coherence = coherence.astype(
+        np.float64 if field is None else np.complex128, copy=False
+    )
     power = pupil.pupil_power if field is None else np.sum(np.abs(field) ** 2)
     coherence[len(coherence) // 2] = power
-    return coherence.reshape(lag_shape)
+    lags = coherence.reshape(lag_shape)
+    if single:
+        static_pupil = np.zeros(tuple(1 - lag_origin), dtype=static_weights.dtype)
+        static_pupil[pupil.y - pupil.y.min(), pupil.x - pupil.x.min()] = static_weights
+        static_lags = _pupil_autocorrelation(static_pupil)
+        static_lags[-lag_origin[0], -lag_origin[1]] = 0
+        lags += static_lags
+    return lags
 
 
 def fold_lags(lags, side):
@@ -191,17 +298,27 @@ def fold_lags(lags, side):
     return folded
 
 
+def validate_detector_intensity(image, full_flux):
+    """Enforce the same numerical intensity limit for both detector transforms."""
+    if not np.isfinite(image).all():
+        raise InvalidCovarianceOptics(
+            "The residual optics produced nonfinite PSF intensity"
+        )
+    if image.min() < -1e-11 * full_flux:
+        raise InvalidCovarianceOptics(
+            "The residual optics produced negative PSF intensity"
+        )
+
+
 def image_from_signed_lags(lags, side, image_side, origin):
     """Evaluate signed-lag coherence at either detector origin and crop."""
     if origin == "geometric":
         y, x = np.indices(lags.shape) - (np.asarray(lags.shape) // 2)[:, None, None]
         lags = lags * np.exp(-1j * np.pi * (x + y) / side)
     image = _image_from_otf(fold_lags(lags, side))
-    if (
-        image.min()
-        < -1e-11 * side**2 * lags[lags.shape[0] // 2, lags.shape[1] // 2].real
-    ):
-        raise ValueError("The finite-pupil covariance produced negative PSF intensity")
+    validate_detector_intensity(
+        image, side**2 * lags[lags.shape[0] // 2, lags.shape[1] // 2].real
+    )
     window = (side - image_side) // 2
     return image[window : window + image_side, window : window + image_side]
 
@@ -209,8 +326,5 @@ def image_from_signed_lags(lags, side, image_side, origin):
 def coherence_image(pupil, residual, image_side, origin, field=None):
     """Integrate the coherence of each pupil pair before Fourier sampling."""
     return image_from_signed_lags(
-        coherence_lags(pupil, residual, field),
-        pupil.side,
-        image_side,
-        origin,
+        coherence_lags(pupil, residual, field), pupil.side, image_side, origin
     )

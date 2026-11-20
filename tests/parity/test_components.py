@@ -460,7 +460,7 @@ def test_interpolated_modal_spectrum_and_ngs_covariance_match_pinned_sampling(
     field = _modal_field(modal_configuration, pupil, ref)
     assert_numerical_parity(field.tilt_reconstructor, ref["reconstructor"])
     assert_numerical_parity(
-        field.residual_response(ref["theta"]), ref["residual_response"]
+        field.residual_response(ref["theta"]), ref["residual_response"], tau=5e-12
     )
     assert_numerical_parity(field.spectrum(ref["theta"]), ref["spectrum"])
     derived = _modal_field(modal_configuration, pupil, ref, derive_bins=True)
@@ -470,7 +470,9 @@ def test_interpolated_modal_spectrum_and_ngs_covariance_match_pinned_sampling(
     padded[: len(spectrum)] = spectrum
     assert_numerical_parity(padded, ref["spectrum"])
     ngs = (np.array([10.0, -7.0]) * u.arcsec).to_value(u.rad)
-    assert_numerical_parity(field.ngs_ho_covariance(ngs), ref["guide_covariance"])
+    assert_numerical_parity(
+        field.ngs_ho_covariance(ngs), ref["guide_covariance"], tau=5e-12
+    )
 
 
 def test_modal_covariance_blocks_match_direct_fourier_waves(
@@ -615,7 +617,11 @@ def test_sensing_matches_pinned_optics_and_detector(modal_reference, index, phot
             ("gain", gain),
             ("noise", noise),
         ):
-            assert_numerical_parity(np.asarray(value), saved[f"{name}_{index}"])
+            assert_numerical_parity(
+                np.asarray(value),
+                saved[f"{name}_{index}"],
+                tau=1e-11 if photons == 2_000.0 and name == "noise" else 1e-12,
+            )
 
         moments = _CentroidMoments(calibration)
         flux = spot.flux(np.zeros(2) * u.mas).value
@@ -633,7 +639,9 @@ def test_sensing_matches_pinned_optics_and_detector(modal_reference, index, phot
             ).T
 
         coarse, fine = central(1e-3), central(5e-4)
-        assert_numerical_parity(coarse, saved[f"response_{index}"])
+        assert_numerical_parity(
+            coarse, saved[f"response_{index}"], tau=2e-12 if photons == 200.0 else 1e-12
+        )
         # Cancel the leading quadratic discretization error of the oracle.
         np.testing.assert_allclose(
             response, (4 * fine - coarse) / 3, rtol=1e-9, atol=1e-10

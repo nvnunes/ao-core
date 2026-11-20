@@ -34,6 +34,7 @@ __all__ = [
     "polc_transfer",
     "reconstructed_noise_covariance",
     "scalar_filter",
+    "scalar_integrator_transfer",
     "settling_cut",
     "state_matrix",
     "tip_tilt_feedback",
@@ -733,3 +734,10 @@ def polc_transfer(
     """Evaluate the scalar leaky pseudo-open-loop response on signed frequencies."""
     z = np.exp(-2j * np.pi * frequency_hz * frame_interval_s)
     return gain * z**delay / (1 - (1 - gain) * z)
+
+
+def scalar_integrator_transfer(z_inverse, strength, gain, delay):
+    """Evaluate the delayed integrator at the supplied inverse delay phase."""
+    return (
+        gain * z_inverse**delay / (1 - z_inverse + gain * strength * z_inverse**delay)
+    )

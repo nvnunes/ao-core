@@ -9,9 +9,66 @@ from numpy.typing import DTypeLike
 from ._units import _input_dtype, _quantity, validate_float_dtype
 
 __all__ = [
+    "factor_modal_covariance",
     "lo_reconstructor",
+    "modal_covariance_blocks",
     "solve_lo_reconstructor",
 ]
+
+
+def modal_covariance_blocks(measurement, target, weights, *, real_contraction=False):
+    """Return measurement and target–measurement covariance on Fourier nodes.
+
+    Response rows are caller-selected channels. Weights include spectral
+    density, layer strength and quadrature weight. The real-contraction
+    form uses a real-inner-product BLAS kernel for tiled modal calculations.
+    For that form supply complex128 response arrays with a contiguous Fourier
+    axis and float64 weights.
+    """
+    if real_contraction:
+        if measurement.dtype != np.complex128 or target.dtype != np.complex128:
+            raise ValueError("The real contraction requires complex128 responses")
+        adjoint = measurement.view(float).T
+        return (
+            (measurement * weights).view(float) @ adjoint,
+            (target * weights).view(float) @ adjoint,
+        )
+    adjoint = measurement.conj().T
+    return (
+        ((measurement * weights) @ adjoint).real,
+        ((target * weights) @ adjoint).real,
+    )
+
+
+def factor_modal_covariance(covariance, *, relative_floor=1e-8):
+    """Return a floored covariance inverse and its inverse-square-root factor.
+
+    The eigensystem uses the symmetric covariance's lower triangle. Eigenvalues
+    are floored relative to the largest one. The factor times its transpose
+    equals the inverse. Supply a finite real symmetric matrix with at least
+    one positive eigenvalue and a positive finite relative floor.
+    """
+    covariance = np.asarray(covariance)
+    if (
+        covariance.ndim != 2
+        or not len(covariance)
+        or covariance.shape[0] != covariance.shape[1]
+        or covariance.dtype.kind not in "fiu"
+        or not np.isfinite(covariance).all()
+    ):
+        raise ValueError("Expected a finite real symmetric modal covariance")
+    if not np.allclose(
+        covariance, covariance.T, rtol=1e-12, atol=1e-12 * np.max(np.abs(covariance))
+    ):
+        raise ValueError("Expected a symmetric modal covariance")
+    if not np.isfinite(relative_floor) or relative_floor <= 0:
+        raise ValueError("Relative eigenvalue floor must be positive and finite")
+    values, vectors = np.linalg.eigh(covariance)
+    floor = values[-1] * relative_floor
+    if not np.isfinite(floor) or floor <= 0:
+        raise ValueError("Modal eigenvalue floor must be positive and finite")
+    floored = np.maximum(values, floor)
+    return (vectors / floored) @ vectors.T, vectors / np.sqrt(floored)
 
 
 def solve_lo_reconstructor(

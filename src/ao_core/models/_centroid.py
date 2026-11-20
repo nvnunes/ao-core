@@ -6,12 +6,15 @@ over the centroid denominator.
 """
 
 from functools import lru_cache
+from typing import Literal
 
 import numpy as np
 from astropy import units as u
 from scipy.interpolate import RectBivariateSpline, make_interp_spline
 from scipy.special import erfcx, log_ndtr, ndtr
 from scipy.stats import poisson
+
+from ._units import _count
 
 
 def _physical_values(value, unit, name):
@@ -190,6 +193,15 @@ def clipped_normal_laplace(counts, times, sigma=0.5, threshold=0.5):
     return zeroth, np.maximum(first, 0), np.maximum(second, 0)
 
 
+def _centroid_jacobian(product, ratio, numerator, m0, d0, d1, coordinates, weights):
+    """Apply the product rule to the integrated centroid numerator and denominator."""
+    derivative = np.einsum("bt,bpt,bti,t->bpi", product, d0 / m0, numerator, weights)
+    derivative += np.einsum(
+        "bt,bpt,pi,t->bpi", product, d1 / m0 - ratio * d0 / m0, coordinates, weights
+    )
+    return derivative
+
+
 class DirectCentroid:
     """Integrate moments and mean-response Jacobians for supplied pixel fluxes.
 
@@ -204,7 +216,10 @@ class DirectCentroid:
     the expected clipped pixel sum for a zero threshold. Fainter rows and
     other detector settings use the positive half-line. Custom settings
     raise FloatingPointError if the quadrature cannot resolve the centroid
-    denominator mass.
+    denominator mass. Choose `bright_quadrature="detected_flux"` to use a
+    finite interval based on the total expected detector photons for every
+    bright row, including custom thresholds. This policy retains the caller's
+    denominator mass diagnostics without automatic fallback.
     """
 
     def __init__(
@@ -214,7 +229,12 @@ class DirectCentroid:
         read_noise: u.Quantity = 0.5 * u.electron,
         threshold: u.Quantity = 0.5 * u.electron,
         nodes: int = 128,
+        *,
+        bright_quadrature: Literal["auto", "detected_flux"] = "auto",
     ):
+        if bright_quadrature not in ("auto", "detected_flux"):
+            raise ValueError("Unknown bright centroid quadrature policy")
+        self.bright_quadrature = bright_quadrature
         self.photons = _scalar(photons, u.photon, "photons")
         self.conversion = _physical_values(
             conversion, u.mas / u.pix, "conversion"
@@ -256,7 +276,9 @@ class DirectCentroid:
 
         The fields are `mean` in mas, `covariance` in mas squared and the
         dimensionless denominator `mass_error`. If requested, `jacobian`
-        has shape (batch, 25, 2) in mas per expected photon.
+        has shape (batch, 25, 2) in mas per expected photon. It differentiates
+        the centroid at the selected quadrature nodes and weights. The
+        finite-interval calculation holds that interval fixed.
         """
         counts = _physical_values(flux, u.photon, "flux")
         result = self._calculate_counts(counts, jacobian=jacobian)
@@ -278,10 +300,13 @@ class DirectCentroid:
             raise ValueError("Expected finite nonnegative batch-by-25 pixel counts")
         total = flux.sum(axis=1)
         default_detector = (self.read_noise, self.threshold) == (0.5, 0.5)
-        bright = (total >= 1000.0) & (default_detector or self.threshold == 0.0)
+        fixed = self.bright_quadrature == "detected_flux"
+        bright = (total >= 1000.0) & (
+            fixed or default_detector or self.threshold == 0.0
+        )
         if not bright.any():
             return self._integrate(flux, jacobian=jacobian)
-        if self.threshold == 0.0:
+        if self.threshold == 0.0 and not fixed:
             _, clipped_mean, _ = clipped_normal_laplace(
                 self.counts, [0.0], sigma=self.read_noise, threshold=0.0
             )
@@ -351,8 +376,10 @@ class DirectCentroid:
         )
         mass = np.einsum("bt,bt,t->b", product, ratio.sum(axis=1), weights)
         answer["mass_error"] = mass - nonempty
-        if (self.read_noise, self.threshold) != (0.5, 0.5) and np.any(
-            np.abs(answer["mass_error"]) > 1e-8
+        if (
+            self.bright_quadrature == "auto"
+            and (self.read_noise, self.threshold) != (0.5, 0.5)
+            and np.any(np.abs(answer["mass_error"]) > 1e-8)
         ):
             if upper is not None:
                 return self._integrate(flux, jacobian=jacobian)
@@ -361,15 +388,65 @@ class DirectCentroid:
             )
         if jacobian:
             d0, d1 = [(probability @ x).reshape(shape) for x in differences]
-            derivative = np.einsum(
-                "bt,bpt,bti,t->bpi", product, d0 / m0, numerator, weights
+            answer["jacobian"] = (
+                _centroid_jacobian(
+                    product, ratio, numerator, m0, d0, d1, self.coordinates, weights
+                )
+                @ C.T
             )
-            derivative += np.einsum(
-                "bt,bpt,pi,t->bpi",
-                product,
-                d1 / m0 - ratio * d0 / m0,
-                self.coordinates,
-                weights,
-            )
-            answer["jacobian"] = derivative @ C.T
         return answer
+
+
+def sample_centroid_errors(
+    rng, flux, mean_centroids, coordinates, conversion, read_noise, threshold, count
+):
+    """Sample errors around the conditional mean of a thresholded centroid.
+
+    Each frame draws a uniform state from a caller's spot ensemble. Supply
+    expected electron counts with shape (states, pixels), detector coordinates
+    with shape (pixels, 2), and conditional means with shape (states, 2).
+    The 2-by-2 conversion maps detector positions into the units of the means.
+    Read noise and threshold are in electrons. The result has shape (count, 2)
+    in the units of the means. The caller's random generator advances only
+    after input validation.
+    """
+    flux, mean_centroids, coordinates, conversion = map(
+        np.asarray, (flux, mean_centroids, coordinates, conversion)
+    )
+    if (
+        flux.ndim != 2
+        or not all(flux.shape)
+        or mean_centroids.shape != (len(flux), 2)
+        or coordinates.shape != (flux.shape[1], 2)
+        or conversion.shape != (2, 2)
+        or any(
+            values.dtype.kind not in "fiu" or not np.isfinite(values).all()
+            for values in (flux, mean_centroids, coordinates, conversion)
+        )
+        or np.any(flux < 0)
+    ):
+        raise ValueError(
+            "Expected finite detector arrays with matching state and pixel axes"
+        )
+    if not np.isfinite(read_noise) or read_noise < 0 or not np.isfinite(threshold):
+        raise ValueError(
+            "Expected nonnegative read noise and finite detector threshold"
+        )
+    _count(count, "count", minimum=0)
+    errors = np.empty((count, 2))
+    for start in range(0, count, 32_768):
+        stop = min(start + 32_768, count)
+        ids = rng.integers(len(flux), size=stop - start)
+        counts = rng.poisson(flux[ids]).astype(float)
+        counts += rng.normal(0, read_noise, counts.shape)
+        weights = np.maximum(counts - threshold, 0.0)
+        total = weights.sum(axis=1)
+        xy = weights @ coordinates
+        centroid = (
+            np.divide(
+                xy, total[:, None], out=np.zeros_like(xy), where=total[:, None] > 0
+            )
+            @ conversion.T
+        )
+        errors[start:stop] = centroid - mean_centroids[ids]
+    return errors

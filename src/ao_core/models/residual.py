@@ -9,6 +9,7 @@ from astropy import units as u
 
 from ._field_covariance import FieldCovariance
 from ._units import _input_dtype, _PhysicalRecord, _quantity
+from ._wind_aligned import wind_aligned_tilt_covariance
 
 __all__ = [
     "FieldCovariance",
@@ -17,6 +18,7 @@ __all__ = [
     "assemble_tilt_residual_covariances",
     "response_covariance",
     "source_minus_correction_covariance",
+    "wind_aligned_tilt_covariance",
 ]
 
 

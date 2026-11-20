@@ -72,6 +72,7 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - polc_transfer
         - reconstructed_noise_covariance
         - scalar_filter
+        - scalar_integrator_transfer
         - settling_cut
         - state_matrix
         - tip_tilt_feedback
@@ -91,17 +92,23 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
     options:
       members:
         - PupilPairGeometry
+        - SuppliedImageModalResponse
+        - covariance_matched_displacement_otfs
 
 ::: ao_core.models.pupil
     options:
       members:
+        - LocalCubicPupilResponse
         - ModalPupil
         - prepare_modal_pupil
+        - sampled_pupil_fourier
 
 ::: ao_core.models.reconstruction
     options:
       members:
+        - factor_modal_covariance
         - lo_reconstructor
+        - modal_covariance_blocks
         - solve_lo_reconstructor
 
 ::: ao_core.models.residual
@@ -113,6 +120,7 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - assemble_tilt_residual_covariances
         - response_covariance
         - source_minus_correction_covariance
+        - wind_aligned_tilt_covariance
 
 ::: ao_core.models.sensing
     options:
@@ -123,7 +131,10 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - centroid_noise_prior
         - clipped_normal_laplace
         - diffraction_calibration
+        - lgs_footprint_phase
+        - modal_lgs_response
         - optical_mean
+        - sample_centroid_errors
         - sensor_response
 
 ::: ao_core.models.uncertainty

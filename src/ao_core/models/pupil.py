@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 from astropy import units as u
 from numpy.polynomial.legendre import leggauss
-from scipy.fft import fft2, ifftshift
+from scipy.fft import fft2, fftfreq, ifftshift
 from scipy.linalg import solve_triangular
 from scipy.ndimage import map_coordinates, spline_filter
 from scipy.special import eval_jacobi
@@ -15,8 +15,10 @@ from scipy.special import eval_jacobi
 from ._units import _quantity
 
 __all__ = [
+    "LocalCubicPupilResponse",
     "ModalPupil",
     "prepare_modal_pupil",
+    "sampled_pupil_fourier",
 ]
 
 ARCSEC = np.pi / (180 * 3600)
@@ -42,27 +44,167 @@ class ModalPupil:
         """Project spatial Fourier waves onto the sampled, piston-free basis."""
         if self.spectrum is None:
             raise ValueError("This optical pupil has no modal Fourier response")
-        if np.max(np.hypot(fx, fy)) >= 0.48 / self.dx:
-            raise ValueError("Fourier query exceeds sampled-pupil Nyquist range")
-        indices = np.array(
-            [
-                fy * self.fft_size * self.dx % self.fft_size,
-                fx * self.fft_size * self.dx % self.fft_size,
-            ]
+        return _cubic_pupil_response(self.spectrum, self.dx, self.fft_size, fx, fy)
+
+
+def _cubic_pupil_response(spectrum, pitch, size, fx, fy):
+    if np.max(np.hypot(fx, fy)) >= 0.48 / pitch:
+        raise ValueError("Fourier query exceeds sampled-pupil Nyquist range")
+    indices = np.array(
+        [
+            np.atleast_1d(fy) * size * pitch % size,
+            np.atleast_1d(fx) * size * pitch % size,
+        ]
+    )
+    values = np.array(
+        [
+            map_coordinates(v.real, indices, order=3, mode="grid-wrap", prefilter=False)
+            + 1j
+            * map_coordinates(
+                v.imag, indices, order=3, mode="grid-wrap", prefilter=False
+            )
+            for v in spectrum
+        ]
+    )
+    values = values.reshape(len(spectrum), *np.shape(fx))
+    return values * np.exp(1j * np.pi * pitch * (fx + fy))
+
+
+def _pupil_spline(image, size):
+    side = len(image)
+    offset = (size - side) // 2
+    field = np.pad(image, ((offset, size - side - offset),) * 2)
+    values = fft2(ifftshift(field)).conj()
+    return spline_filter(values.real, order=3, mode="grid-wrap") + 1j * spline_filter(
+        values.imag, order=3, mode="grid-wrap"
+    )
+
+
+def _frequency_arrays(fx, fy):
+    fx, fy = np.asarray(fx), np.asarray(fy)
+    if (
+        fx.shape != fy.shape
+        or not fx.size
+        or any(f.dtype.kind not in "fiu" or not np.isfinite(f).all() for f in (fx, fy))
+    ):
+        raise ValueError("Require matching nonempty arrays of finite real frequencies")
+    return fx, fy
+
+
+def sampled_pupil_fourier(weights, support, fx, fy, *, fft_size):
+    """Evaluate positive-exponent Fourier projections for real pupil weights.
+
+    Weights have shape (mode, y, x) and include their pupil normalization.
+    Support is the span between first and last pupil samples in metres. The
+    padded grid is even, and native weights are embedded on its centred pixels.
+    Query arrays match in shape and give spatial frequencies in cycles/m.
+    Returns shape (mode, *frequency_shape). Work proceeds one mode at a time
+    to avoid storing a padded transform for every mode.
+    """
+    weights = np.asarray(weights)
+    fx, fy = _frequency_arrays(fx, fy)
+    if (
+        weights.ndim != 3
+        or weights.shape[1] != weights.shape[2]
+        or weights.shape[1] < 2
+        or weights.dtype.kind not in "fiu"
+        or not len(weights)
+        or not np.isfinite(weights).all()
+        or type(fft_size) is not int
+        or fft_size < weights.shape[1]
+        or fft_size % 2
+        or (fft_size - weights.shape[1]) % 2
+    ):
+        raise ValueError("Require real sampled weights on an even square padded grid")
+    if not np.isfinite(support) or support <= 0:
+        raise ValueError("Require positive finite pupil support")
+    weights = weights.astype(float, copy=False)
+    pitch = support / (weights.shape[1] - 1)
+    result = np.empty((len(weights), *fx.shape), dtype=complex)
+    for index, image in enumerate(weights):
+        result[index] = _cubic_pupil_response(
+            _pupil_spline(image, fft_size)[None], pitch, fft_size, fx, fy
+        )[0]
+    return result
+
+
+class LocalCubicPupilResponse:
+    """Positive-exponent Fourier response of real pupil weights.
+
+    The weights have shape (channel, y, x) with the caller's normalization.
+    Support is in metres. The padded FFT is evaluated with a local four-node
+    Lagrange stencil per axis. Query coordinates are cycles/m. For an
+    even pupil, the full stencil must lie inside the signed FFT bins.
+    """
+
+    def __init__(self, weights, support, *, fft_size):
+        weights = np.asarray(weights)
+        if (
+            weights.ndim != 3
+            or weights.shape[1] != weights.shape[2]
+            or weights.shape[1] < 2
+            or weights.dtype.kind not in "fiu"
+            or not len(weights)
+            or not np.isfinite(weights).all()
+            or not np.isfinite(support)
+            or support <= 0
+            or type(fft_size) is not int
+            or fft_size < weights.shape[1]
+            or fft_size % 2
+        ):
+            raise ValueError("Invalid pupil weights, support or Fourier grid")
+        weights = weights.astype(float, copy=False)
+        side, size = weights.shape[1], fft_size
+        dx = support / (side - 1)
+        offset = (size - side) // 2
+        fields = np.pad(
+            weights,
+            ((0, 0), (offset, size - side - offset), (offset, size - side - offset)),
         )
-        values = np.array(
-            [
-                map_coordinates(
-                    v.real, indices, order=3, mode="grid-wrap", prefilter=False
-                )
-                + 1j
-                * map_coordinates(
-                    v.imag, indices, order=3, mode="grid-wrap", prefilter=False
-                )
-                for v in self.spectrum
-            ]
+        transform = fft2(np.fft.ifftshift(fields, axes=(-2, -1))).conj()
+        del fields
+        frequency = fftfreq(size, dx)
+        displacement = offset + (side - 1) / 2 - size / 2
+        # Embedded pixel coordinates differ from centred physical coordinates.
+        transform *= np.exp(
+            -2j * np.pi * displacement * dx * (frequency[:, None] + frequency[None])
         )
-        return values * np.exp(1j * np.pi * self.dx * (fx + fy))
+        self.transform, self.size, self.dx = transform, size, dx
+        self._half_sample_centre = side % 2 == 0
+
+    def __call__(self, fx, fy):
+        """Evaluate the response in caller channel order at the supplied nodes."""
+        fx, fy = _frequency_arrays(fx, fy)
+        if max(np.max(abs(fx)), np.max(abs(fy))) >= 0.49 / self.dx:
+            raise ValueError("Sampled-pupil query exceeds the validated Nyquist range")
+        x, y = fx * self.size * self.dx, fy * self.size * self.dx
+        ix, iy = np.floor(x).astype(int), np.floor(y).astype(int)
+        if self._half_sample_centre and any(
+            index.min() - 1 < -self.size // 2 or index.max() + 2 >= self.size // 2
+            for index in (ix, iy)
+        ):
+            raise ValueError("Cubic pupil interpolation stencil crosses Nyquist")
+
+        def weights(t):
+            return [
+                -t * (t - 1) * (t - 2) / 6,
+                (t + 1) * (t - 1) * (t - 2) / 2,
+                -(t + 1) * t * (t - 2) / 2,
+                (t + 1) * t * (t - 1) / 6,
+            ]
+
+        wx, wy = weights(x - ix), weights(y - iy)
+        result = np.zeros((len(self.transform), *fx.shape), dtype=complex)
+        for i in range(4):
+            for j in range(4):
+                result += (
+                    wx[i]
+                    * wy[j]
+                    * self.transform[
+                        :, (iy + j - 1) % self.size, (ix + i - 1) % self.size
+                    ]
+                )
+        return result
 
 
 def make_pupil(
@@ -111,19 +253,13 @@ def make_pupil(
     weights = basis * intensity
     np.testing.assert_allclose(weights @ basis.T, np.eye(len(basis)), atol=1e-10)
     size = 512
-    offset = (size - side) // 2
     transform = None
     if fourier_response:
         transform = []
         for row in weights:
             image = np.zeros((side, side))
             image[mask] = row
-            field = np.pad(image, ((offset, size - side - offset),) * 2)
-            values = fft2(ifftshift(field)).conj()
-            transform.append(
-                spline_filter(values.real, order=3, mode="grid-wrap")
-                + 1j * spline_filter(values.imag, order=3, mode="grid-wrap")
-            )
+            transform.append(_pupil_spline(image, size))
         transform = np.asarray(transform)
     return ModalPupil(
         amplitude,

@@ -440,7 +440,7 @@ def test_interpolated_modal_spectrum_and_ngs_covariance_match_pinned_sampling(
     spectrum = derived.spectrum(ref["theta"])
     assert len(spectrum) < len(ref["spectrum"])
     padded = np.zeros_like(ref["spectrum"])
-    padded[:len(spectrum)] = spectrum
+    padded[: len(spectrum)] = spectrum
     assert_numerical_parity(padded, ref["spectrum"])
     ngs = (np.array([10.0, -7.0]) * u.arcsec).to_value(u.rad)
     assert_numerical_parity(field.ngs_ho_covariance(ngs), ref["guide_covariance"])
@@ -541,6 +541,7 @@ def test_restored_coherence_and_lags_match_pinned_sampling(
 
 @pytest.mark.parametrize("index, photons", [(0, 200.0), (1, 2_000.0)])
 def test_sensing_matches_pinned_optics_and_detector(modal_reference, index, photons):
+    from ao_core.models._sensor import _CentroidMoments
     from ao_core.models.pupil import optical_pupil
     from ao_core.models.sensing import (
         diffraction_calibration,
@@ -586,9 +587,30 @@ def test_sensing_matches_pinned_optics_and_detector(modal_reference, index, phot
             ("signed_flux", signed_flux),
             ("gain", gain),
             ("noise", noise),
-            ("response", response),
         ):
             assert_numerical_parity(np.asarray(value), saved[f"{name}_{index}"])
+
+        moments = _CentroidMoments(calibration)
+        flux = spot.flux(np.zeros(2) * u.mas).value
+
+        def central(step):
+            return np.array(
+                [
+                    (
+                        moments.calculate(flux + step * direction)["mean"][0]
+                        - moments.calculate(flux - step * direction)["mean"][0]
+                    )
+                    / (2 * step)
+                    for direction in signed_flux
+                ]
+            ).T
+
+        coarse, fine = central(1e-3), central(5e-4)
+        assert_numerical_parity(coarse, saved[f"response_{index}"])
+        # Cancel the leading quadratic discretization error of the oracle.
+        np.testing.assert_allclose(
+            response, (4 * fine - coarse) / 3, rtol=1e-9, atol=1e-10
+        )
         np.testing.assert_array_equal(
             noise, details["conditional_covariance_mas2"].mean(axis=0)
         )
@@ -684,8 +706,6 @@ def test_bright_clipped_detector_uses_exact_moments_and_empty_response_shape():
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"difference_step": 0}, "difference_step"),
-        ({"difference_step": np.nan}, "difference_step"),
         ({"offsets_mas": [[0, 0], [10, 0]]}, "span both axes"),
     ],
 )

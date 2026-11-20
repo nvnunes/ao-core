@@ -13,6 +13,7 @@ from scipy.stats import poisson
 from ._centroid import (
     DirectCentroid,
     PixelSpot,
+    _centroid_jacobian,
     _legendre_nodes,
     clipped_normal_laplace,
 )
@@ -34,11 +35,13 @@ class _CentroidMoments:
         x, y = np.meshgrid(np.arange(5) - 2, np.arange(5) - 2)
         self.coordinates = np.column_stack([x.ravel(), y.ravel()])
 
-    def calculate(self, flux):
+    def calculate(self, flux, *, jacobian=False):
         flux = np.asarray(flux, float)
         if flux.ndim != 2 or flux.shape[1] != 25 or np.any(flux < 0):
             raise ValueError("Require nonnegative batch-by-25 photon expectations")
         answer = {key: [] for key in ("mean", "covariance", "mass_error")}
+        if jacobian:
+            answer["jacobian"] = []
         for row in flux:
             if row.sum() < 1000 or (self.read_noise, self.threshold) != (0.5, 0.5):
                 # Bound the photon sum by the brightest pixel, not total light.
@@ -49,14 +52,14 @@ class _CentroidMoments:
                     self.threshold * u.electron,
                     self.nodes,
                 )
-                result = exact._calculate_counts(row[None])
+                result = exact._calculate_counts(row[None], jacobian=jacobian)
             else:
-                result = self._bright(row)
+                result = self._bright(row, jacobian=jacobian)
             for key, values in answer.items():
                 values.append(result[key][0])
         return {key: np.asarray(values) for key, values in answer.items()}
 
-    def _bright(self, flux):
+    def _bright(self, flux, *, jacobian=False):
         points, weights = _legendre_nodes(self.nodes)
         upper = 64 / flux.sum()
         times, weights = (points + 1) * upper / 2, weights * upper / 2
@@ -65,11 +68,14 @@ class _CentroidMoments:
         bound = float(flux[faint].max()) if faint.any() else 0.0
         counts = np.arange(int(np.ceil(bound + 12 * np.sqrt(bound + 1) + 30)) + 1)
         conditional = clipped_normal_laplace(
-            counts, times, self.read_noise, self.threshold
+            np.append(counts, counts[-1] + 1) if jacobian else counts,
+            times,
+            self.read_noise,
+            self.threshold,
         )
         probability = poisson.pmf(counts[None], flux[faint, None])
         for target, value in zip((m0, m1, m2), conditional, strict=True):
-            target[faint] = probability @ value
+            target[faint] = probability @ (value[:-1] if jacobian else value)
         count = flux[~faint, None]
         decay = np.exp(-times)[None]
         zero = np.exp(
@@ -98,11 +104,39 @@ class _CentroidMoments:
         c = self.conversion
         # Empty-read probability is negligible when total detected flux >=1000.
         mass = np.sum(product * ratio.sum(0) * weights)
-        return {
+        answer = {
             "mean": (c @ mean)[None],
             "covariance": (c @ covariance @ c.T)[None],
             "mass_error": np.array([mass - 1]),
         }
+        if jacobian:
+            d0, d1 = np.empty_like(m0), np.empty_like(m1)
+            d0[faint] = probability @ np.diff(conditional[0], axis=0)
+            d1[faint] = probability @ np.diff(conditional[1], axis=0)
+            laplace_delta = np.expm1(-times)
+            d0[~faint] = zero * laplace_delta
+            d1[~faint] = zero * (first * laplace_delta + decay)
+            derivative = _centroid_jacobian(
+                product[None],
+                ratio[None],
+                numerator[None],
+                m0[None],
+                d0[None],
+                d1[None],
+                self.coordinates,
+                weights,
+            )
+            # The finite integration interval scales as 64 / sum(flux).
+            integrand_slope = product[:, None] * (
+                -ratio.sum(axis=0)[:, None] * numerator
+                - (m2 / m0 - ratio**2).T @ self.coordinates
+            )
+            rescaling = (
+                -(mean + np.einsum("ti,t,t->i", integrand_slope, times, weights))
+                / flux.sum()
+            )
+            answer["jacobian"] = (derivative + rescaling) @ c.T
+        return answer
 
 
 def _derivative_lags(basis, coherence, y, x, size):
@@ -273,7 +307,6 @@ def sensor_response(
     offsets_mas=None,
     read_noise_e=0.5,
     threshold_e=0.5,
-    difference_step=1e-3,
 ):
     """Fixed-range Hybrid sensing gain, centred runtime noise and HO response.
 
@@ -283,10 +316,9 @@ def sensor_response(
     The gain is dimensionless, the conditional covariance is in mas squared
     and the phase responses are mas per radian of the supplied mode.
     The displacement ranges determine gain and state-averaged
-    conditional covariance. Supplied offsets must span both axes and the
-    finite-difference step must be positive and finite. Pixel derivatives are
-    evaluated around the mean
-    shape, with the actual random centroid denominator retained. This is a
+    conditional covariance. Supplied offsets must span both axes. Contract
+    the optical pixel derivatives with the analytic centroid Jacobian at
+    zero displacement, retaining the random centroid denominator. This is a
     mean-HO-shape closure, not an instantaneous nonlinear sensor model.
     """
     radii = (10, 30, 50, 70) if count == 1 else (20, 40)
@@ -299,8 +331,6 @@ def sensor_response(
             for s in (-1, 1)
         ]
     )
-    if not np.isfinite(difference_step) or difference_step <= 0:
-        raise ValueError("difference_step must be finite and positive")
     if offsets_mas is not None:
         offsets = np.asarray(offsets_mas, dtype=np.float64)
         if (
@@ -320,23 +350,19 @@ def sensor_response(
     gains = np.linalg.lstsq(offsets, result["mean"], rcond=None)[0].T
     covariance = result["covariance"].mean(0)
     zero = spot.flux(np.zeros(2) * u.mas).value
-    # Pixel integration is linear. Signed derivative images therefore use the
-    # same integral by separating positive/negative parts; no flux renormalizing.
-    responses = []
-    step = difference_step
-    for derivative in derivatives:
-        direction = spot.derivative_flux(derivative).value
-        if np.min(zero - step * abs(direction)) < 0:
-            raise ValueError("HO response step exceeds positive photon support")
-        plus = moments.calculate(zero + step * direction)["mean"][0]
-        minus = moments.calculate(zero - step * direction)["mean"][0]
-        responses.append((plus - minus) / (2 * step))
+    count_derivatives = [spot.derivative_flux(mode).value[0] for mode in derivatives]
+    centre = moments.calculate(zero, jacobian=bool(count_derivatives))
+    responses = (
+        (np.asarray(count_derivatives) @ centre["jacobian"][0]).T
+        if count_derivatives
+        else np.empty((2, 0))
+    )
     if np.linalg.eigvalsh(covariance).min() <= 0 or not np.isfinite(gains).all():
         raise ValueError("Invalid PSF-driven sensor moments")
     return (
         gains,
         covariance,
-        np.asarray(responses).reshape(-1, 2).T,
+        responses,
         {
             "gain": gains.tolist(),
             "runtime_covariance_mas2": covariance.tolist(),
@@ -345,7 +371,7 @@ def sensor_response(
                 float(flux.sum(1).min()),
                 float(flux.sum(1).max()),
             ],
-            "mean_center_mas": moments.calculate(zero)["mean"][0].tolist(),
+            "mean_center_mas": centre["mean"][0].tolist(),
             "offsets_mas": offsets,
             "conditional_mean_mas": result["mean"],
             "conditional_covariance_mas2": result["covariance"],

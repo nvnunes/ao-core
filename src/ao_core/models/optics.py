@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
+from ._displacement import covariance_matched_displacement_otfs
+from ._supplied_optics import SuppliedImageModalResponse
+
 __all__ = [
     "PupilPairGeometry",
+    "SuppliedImageModalResponse",
+    "covariance_matched_displacement_otfs",
 ]
 
 

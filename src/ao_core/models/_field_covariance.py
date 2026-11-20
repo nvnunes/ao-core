@@ -11,7 +11,12 @@ from .atmosphere import frozen_flow_frequency, von_karman_spectrum
 from .config import Configuration
 from .control import polc_transfer
 from .pupil import CORRECTION_CUTOFF, ModalPupil, quadrature
-from .reconstruction import lo_reconstructor
+from .reconstruction import (
+    factor_modal_covariance,
+    lo_reconstructor,
+    modal_covariance_blocks,
+)
+from .sensing import lgs_footprint_phase, modal_lgs_response
 
 SETUP_TILE_NODES = 8192
 
@@ -70,22 +75,7 @@ def _ideal_modal_lgs_factors(
     modes = (uncontracted_modes if cone == 1 else project_pupil(cone * fx, cone * fy))[
         2:
     ]
-    phase = np.exp(
-        2j
-        * np.pi
-        * layer_height_m
-        * (directions_rad[:, :1] * fx + directions_rad[:, 1:] * fy)
-    )
-    return modes, phase
-
-
-def _expand_modal_lgs_response(modes, phase, *, out=None):
-    """Form beacon-major WFS channels by multiplying the two layer factors."""
-    shape = (len(phase), *modes.shape)
-    if out is not None:
-        out = out.reshape(shape)
-    response = np.multiply(phase[:, None], modes[None], out=out)
-    return response.reshape(shape[0] * shape[1], shape[2])
+    return modes, lgs_footprint_phase(fx, fy, layer_height_m, directions_rad)
 
 
 class FieldCovariance:
@@ -271,7 +261,7 @@ class FieldCovariance:
                 self.lgs_modes[:, selection] = contracted
                 self.lgs_phase[:, selection] = phase
             else:
-                _expand_modal_lgs_response(
+                modal_lgs_response(
                     contracted, phase, out=self.weighted_measurement[:, selection]
                 )
             mean_phase = fitweights @ np.exp(
@@ -286,12 +276,15 @@ class FieldCovariance:
                     if stored_modes
                     else self.weighted_measurement[:, columns]
                 )
-                measured_columns = measured.view(float).T
-                covariance += (measured * weights[tile]).view(float) @ measured_columns
-                common_target += (
-                    original[2:, tile] * mean_phase[tile] * weights[tile]
-                ).view(float) @ measured_columns
-                del measured, measured_columns
+                measured_covariance, target_covariance = modal_covariance_blocks(
+                    measured,
+                    original[2:, tile] * mean_phase[tile],
+                    weights[tile],
+                    real_contraction=True,
+                )
+                covariance += measured_covariance
+                common_target += target_covariance
+                del measured
             if common_only:
                 continue
             ngs_phase = np.exp(
@@ -300,11 +293,7 @@ class FieldCovariance:
             tilt = (ngs_phase[:, None] * original[None, :2]).reshape(2 * len(ngs), -1)
             tilt_covariance += ((tilt * weights) @ tilt.conj().T).real
             tilt_target += ((original[:2] * weights) @ tilt.conj().T).real
-        values, vectors = np.linalg.eigh(covariance)
-        self.inverse = (vectors / np.maximum(values, values[-1] * 1e-8)) @ vectors.T
-        self.reconstruction_factor = vectors / np.sqrt(
-            np.maximum(values, values[-1] * 1e-8)
-        )
+        self.inverse, self.reconstruction_factor = factor_modal_covariance(covariance)
         common_reconstructor = common_target @ self.inverse
         # Optional design prior is in the reference-wavelength modal-phase basis.
         prior = None
@@ -465,7 +454,7 @@ class FieldCovariance:
         """Expand the four LGS responses for a tile of the factored grid."""
         modes = self.lgs_modes[:, samples]
         phase = self.lgs_phase[:, samples]
-        return _expand_modal_lgs_response(modes, phase)
+        return modal_lgs_response(modes, phase)
 
     def factored_residual(self, samples, common):
         """Apply the common correction and controller delay to one LGS tile."""

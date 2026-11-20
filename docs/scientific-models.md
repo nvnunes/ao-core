@@ -7,11 +7,18 @@ See the [Python reference](reference/api.md) for their public APIs.
 ## Scientific Components
 
 `PixelSpot` integrates an incident-normalized optical image over a 5×5
-detector at supplied angular offsets. The integral retains light lost
-outside the image or detector window. `DirectCentroid` calculates
+detector at supplied angular offsets. The integral leaves flux in
+incident-photon units, preserving cropping losses. `DirectCentroid` calculates
 thresholded centroid means and covariances using the conditional Poisson
 and read-noise moments. Its optional photon Jacobian uses the same
-denominator integral.
+denominator integral. For an incident-normalized supplied spot,
+`SuppliedImageModalResponse` transfers selected pupil-mode derivatives to
+the image and integrates them over aligned detector pixels. Multiply the
+integrated flux and its derivatives by the incident photons per frame.
+Evaluate `DirectCentroid.calculate(..., jacobian=True)` at those expected
+counts and contract its Jacobian with the photon-count derivatives. The sampling uncertainty model
+uses `sensor_response` with image-grid derivatives. It integrates those
+derivatives over the detector before applying the centroid Jacobian.
 
 ```python
 import numpy as np
@@ -41,6 +48,10 @@ and `command_noise_covariance` propagates noise through the actual feedback.
 `assemble_tilt_residual_covariances` combines the supplied angular command
 and cross-covariance terms with that command noise. Applications evaluate
 those inputs and use the resulting residual covariances.
+`wind_aligned_tilt_covariance` integrates unfiltered and filtered channels
+over the continuous frozen-flow spectrum. `sample_centroid_errors` draws
+conditional detector errors for loop replay. `covariance_matched_displacement_otfs`
+converts a command-displacement record to an OTF at the supplied covariance.
 
 `prepare_modal_pupil` builds piston-free modes on the sampled aperture.
 `FieldCovariance` uses the supplied atmospheric layers, projected beacon

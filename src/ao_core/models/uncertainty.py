@@ -25,6 +25,7 @@ from ._metric_covariance import (
 )
 from ._sampling_grid import SamplingSettings
 from ._units import _PhysicalRecord, _quantity, validate_float_dtype
+from .atmosphere import _project_zenith_atmosphere
 from .config import Configuration
 from .control import integrator_noise_lags
 from .pupil import ARCSEC, make_pupil, optical_pupil
@@ -221,26 +222,17 @@ def _sampling_frame_interval(config):
 
 def _project_sampling_configuration(config):
     """Resolve the observing geometry used by the sampling calculations."""
-    atmosphere = _required(config.atmosphere, "Atmosphere", "reference_wavelength")
-    fried = atmosphere.fried_parameter
-    if atmosphere.seeing is not None:
-        fried = (
-            0.976 * atmosphere.reference_wavelength / atmosphere.seeing.to_value(u.rad)
-        )
-    if fried is None:
-        raise ValueError("Sampling requires Seeing or a Fried parameter")
-    _required(atmosphere, "Atmosphere", "layer_heights")
+    atmosphere = _required(
+        config.atmosphere, "Atmosphere", "reference_wavelength", "layer_heights"
+    )
+    atmosphere, airmass = _project_zenith_atmosphere(
+        atmosphere, config.telescope.zenith_angle
+    )
     high_order = _required(config.high_order_sources, "Beacon geometry", "height")
-    angle = config.telescope.zenith_angle
-    airmass = 1.0 if angle is None else 1 / np.cos(angle.to_value(u.rad))
     low_order = _required(config.low_order_sources, "Guide stars", "wavelengths")
     return replace(
         config,
-        atmosphere=replace(
-            atmosphere,
-            fried_parameter=fried * airmass ** (-3 / 5),
-            layer_heights=atmosphere.layer_heights * airmass,
-        ),
+        atmosphere=atmosphere,
         high_order_sources=replace(high_order, height=high_order.height * airmass),
         low_order_sources=replace(
             low_order, directions=u.Quantity([star.position for star in config.ngs])

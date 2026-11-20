@@ -8,12 +8,12 @@ from functools import cache
 
 import contourpy
 import numpy as np
-from scipy.fft import fft2, fftshift, ifftshift
+from scipy.fft import fft2, ifftshift
 from scipy.interpolate import interp1d
 from scipy.ndimage import shift
 from scipy.signal import resample
 
-from .optics import PupilPairGeometry
+from .optics import PupilPairGeometry, _image_from_otf, _sum_pairs_by_lag
 
 
 @cache
@@ -146,12 +146,8 @@ def metric_responses(image, pixel_scale, *, metric_indices=(0, 1, 2)):
 def image_metric_kernels(geometry, coherence, metric_indices):
     """Return requested image metrics, pixel gradients and pupil-pair kernels."""
     size = geometry.pupil.optical_size
-    flat_lag = geometry.flat_lag
-    otf = (
-        np.bincount(flat_lag, weights=coherence.real.ravel(), minlength=size**2)
-        + 1j * np.bincount(flat_lag, weights=coherence.imag.ravel(), minlength=size**2)
-    ).reshape(size, size)
-    mean = fftshift(fft2(otf)).real / geometry.normalization
+    otf = _sum_pairs_by_lag(coherence, geometry.flat_lag, size**2).reshape(size, size)
+    mean = _image_from_otf(otf) / geometry.normalization
     metrics, gradients = metric_responses(
         mean, geometry.pixel_scale, metric_indices=metric_indices
     )

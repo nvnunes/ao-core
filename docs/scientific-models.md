@@ -72,6 +72,67 @@ and `settling_cut` cover scalar feedback and its settling window.
 `lo_reconstructor` accepts numerical covariance arrays in mas². Use
 `solve_lo_reconstructor` for the equivalent quantity-based API.
 
+## High-Order PSFs
+
+`HoPsfModel.predict()` takes a `HoPsfRequest` with resolved science
+directions, one wavelength, and detector sampling. For diffraction, supply
+the pupil with `atmosphere=None` and no mirrors. For corrected PSFs, supply
+the atmosphere, guide stars, square lenslets, fitting field, a ground-conjugate
+Gaussian common DM, and the common high-order loop (`high_order_loop`). The
+calculation uses instantaneous noise-free slope measurements and projected
+pseudo-open-loop control. It includes differential refraction and correction
+chromatism.
+
+Use square lenslets of equal pitch whose nominal grid spans the telescope
+diameter. The Fourier period, given by wavelength divided by angular pixel
+scale in radians, must span a positive even number of lenslet pitches.
+
+The common high-order loop requires a gain in [0, 1], a positive frame rate,
+and a whole-frame delay. If the guide and science wavelengths differ, both
+must be in the 0.3–2.5 µm refractivity range. The predictor derives the
+refraction direction from the Cartesian science offset. For an on-axis
+point, it uses the supplied polar azimuth, or zero if the input was purely
+Cartesian.
+
+For two-stage correction, supply a ground-conjugate Gaussian science channel
+DM and set the residual high-order loop (`residual_high_order_loop`). The
+science DM applies an open-loop command computed for each science direction.
+Its gain must be nonnegative. With positive gain, give the delay in whole
+common-loop frames. Any residual high-order loop frame rate supplied for
+this case must match the common high-order loop. The model retains the
+cross-covariance between the DM commands. Zero gain disables the science
+DM correction.
+
+For an OPD map that varies across the illuminated pupil, use
+`static_opd_sampling="resampled"` to sample the map on the native optical
+pupil with RMS compensation. Set
+`"original_map"` to retain the original static diffraction and transfer the
+coarse atmospheric coherence onto that grid. The latter requires the Fourier
+period to span an even integer number of original pupil samples and to
+cover both the original pupil and the output detector grid. The model uses
+a chirp-Z transform for crops. `full_flux` refers to the complete original-map
+plane.
+
+Use `detector_origin="fft"` to sample at integer offsets from the native
+FFT origin. Use `"geometric"` to sample at half-integer offsets around the
+centre of an even detector window. The model samples directly on either
+grid and returns `float64` images. Divide `prediction.psfs` by the shared
+`prediction.full_flux` to express intensities as fractions of the total
+uncropped flux.
+
+This example uses a resolved INI with nominal DM geometry and no varying
+static OPD. For a configuration with calibrated DM geometry, supply
+`mirror_geometries` before prediction. [Model configuration](model-configuration.md)
+
+```python
+from ao_core.models.config import load_ao_configuration
+from ao_core.models.ho_psf import HoPsfModel, HoPsfRequest, decode_ho_psf
+
+config = load_ao_configuration("system.ini", decode=decode_ho_psf)
+prediction = HoPsfModel().predict(HoPsfRequest(config=config))
+psfs = prediction.psfs / prediction.full_flux
+```
+
 ## Sampling Uncertainty
 
 `SamplingUncertaintyModel` predicts finite-exposure sampling uncertainty. Supply a

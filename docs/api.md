@@ -15,4 +15,5 @@ The [PSF measurement guide](stats.md) explains how to use `ao_core.stats`.
 The [model configuration guide](model-configuration.md) explains how to use
 `ao_core.models.config`.
 The [scientific models guide](scientific-models.md) describes shared model
-components and the sampling predictor.
+components and the [high-order PSF](scientific-models.md#high-order-psfs)
+and [sampling uncertainty](scientific-models.md#sampling-uncertainty) predictors.

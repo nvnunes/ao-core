@@ -279,7 +279,7 @@ def test_loader_rebinds_relative_pupil_before_decoding(tmp_path, monkeypatch):
             "config/system.ini", decode=lambda *_: pytest.fail("decoded early")
         )
     result = load_ao_configuration(
-        "config/system.ini", prepare_ini=prepare, decode=decode
+        "config/system.ini", prepare=prepare, decode=decode
     )
     assert isinstance(result, ModelConfig)
     assert result.pupil.pitch == 2 * u.m

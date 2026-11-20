@@ -75,7 +75,18 @@ determine the inputs and defaults required by their model.
   and `InfCoupling` to `Configuration.mirrors` in INI order. The reader
   applies one influence model name to the listed mirrors. Supplied numeric
   vectors have one value per mirror. The existing `[DM] Optimization*`
-  fields supply the separate fitting directions and weights.
+  fields supply the fitting directions and weights for the common correction.
+- The HO PSF decoder reads a science channel DM from `[DM_science]` using
+  the same DM keys. It appends the science DM to `mirrors`. The common
+  high-order loop (`high_order_loop`) comes from `[RTC]`. The residual
+  high-order loop (`residual_high_order_loop`) comes from `[RTC_science]`.
+  Both use `LoopGain_HO` and `LoopDelaySteps_HO`. The frame rate comes from
+  `[RTC] SensorFrameRate_HO`. If supplied in `[RTC_science]`, the rate must
+  match the common high-order loop for an active science DM.
+  The decoder checks explicit HO model options against its square-cell
+  Shack–Hartmann, finite-aperture, mean-slope-removal and zero injected
+  noise assumptions. It accepts `[telescope] extraErrorNm` only at zero.
+  See the [high-order PSF guide](scientific-models.md#high-order-psfs).
 
 ## Extending Configuration
 
@@ -116,10 +127,10 @@ returned object. A further decoder can extend `ReconstructionConfig` using
 its own subtype's `from_config()` method. Each extension supplies its added
 fields and carries forward the resolved values from the preceding config.
 
-Use `prepare_ini(source)` to update the parser before shared decoding, for
-example to bind an archived pupil path to its retained file. File references
-are resolved relative to `source.path`. The original INI text remains in
-`source.text` for provenance.
+Pass `prepare=...` to update the parser before shared decoding, for example
+to bind an archived pupil path to its retained file. The callback receives
+the parsed source. File references are resolved relative to `source.path`.
+The original INI text remains in `source.text` for provenance.
 
 Set `load_pupil=False` when another provider supplies the pupil. The loader
 still decodes the shared INI metadata and passes it to the extension.

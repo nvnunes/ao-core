@@ -178,8 +178,11 @@ class SourceConfig:
 
     def __post_init__(self):
         _quantities(
-            self, zenith=(u.arcsec, 1), azimuth=(u.deg, 1),
-            wavelengths=(u.m, 1), height=(u.m, 0),
+            self,
+            zenith=(u.arcsec, 1),
+            azimuth=(u.deg, 1),
+            wavelengths=(u.m, 1),
+            height=(u.m, 0),
         )
         directions = self.directions
         if (self.zenith is None) != (self.azimuth is None):
@@ -236,7 +239,8 @@ class DeformableMirrorConfig:
         if self.actuator_count is not None:
             _count(self.actuator_count, "actuator_count", 1)
         if self.influence_model is not None and (
-            not isinstance(self.influence_model, str) or not self.influence_model.strip()
+            not isinstance(self.influence_model, str)
+            or not self.influence_model.strip()
         ):
             raise ValueError("influence_model must be a nonempty string")
 
@@ -480,7 +484,9 @@ class Configuration:
     low_order_loop: LoopConfig | None = None
     pupil: Pupil | None = None
     ngs: tuple[NaturalGuideStar, ...] = ()
-    sampling_uncertainty_model: SamplingSettings = field(default_factory=SamplingSettings)
+    sampling_uncertainty_model: SamplingSettings = field(
+        default_factory=SamplingSettings
+    )
 
     def __post_init__(self):
         if self.pupil is not None and not isinstance(self.pupil, Pupil):
@@ -528,13 +534,17 @@ class Configuration:
             high_order_loop=LoopConfig.from_ini(ini_parser, stage="HO"),
             low_order_loop=LoopConfig.from_ini(ini_parser, stage="LO"),
             pupil=(
-                _read_pupil(ini_parser, ini_path, telescope_config) if load_pupil else None
+                _read_pupil(ini_parser, ini_path, telescope_config)
+                if load_pupil
+                else None
             ),
             sampling_uncertainty_model=SamplingSettings._from_ini(ini_parser),
         )
 
     @classmethod
-    def from_config(cls, config: "Configuration", /, **extension_fields: object) -> Self:
+    def from_config(
+        cls, config: "Configuration", /, **extension_fields: object
+    ) -> Self:
         """Construct a config subtype with the existing fields and new values.
 
         Pass an instance of a base class of ``cls`` and the added fields for
@@ -547,7 +557,9 @@ class Configuration:
                 "The target configuration type must extend the supplied configuration"
             )
         inherited = {
-            item.name: getattr(config, item.name) for item in fields(config) if item.init
+            item.name: getattr(config, item.name)
+            for item in fields(config)
+            if item.init
         }
         return cls(**inherited, **extension_fields)
 
@@ -580,7 +592,7 @@ class Configuration:
 def load_ao_configuration(
     path: str | Path,
     *,
-    prepare_ini: Callable[[IniSource], None] | None = None,
+    prepare: Callable[[IniSource], None] | None = None,
     load_pupil: bool = True,
     decode: None = None,
 ) -> Configuration: ...
@@ -590,7 +602,7 @@ def load_ao_configuration(
 def load_ao_configuration[T: Configuration](
     path: str | Path,
     *,
-    prepare_ini: Callable[[IniSource], None] | None = None,
+    prepare: Callable[[IniSource], None] | None = None,
     load_pupil: bool = True,
     decode: Callable[[IniSource, Configuration], T],
 ) -> T: ...
@@ -599,13 +611,13 @@ def load_ao_configuration[T: Configuration](
 def load_ao_configuration(
     path: str | Path,
     *,
-    prepare_ini: Callable[[IniSource], None] | None = None,
+    prepare: Callable[[IniSource], None] | None = None,
     load_pupil: bool = True,
     decode: Callable[[IniSource, Configuration], Configuration] | None = None,
 ) -> Configuration:
     """Read one AO INI and decode its shared configuration once.
 
-    An optional ``prepare_ini(ini_source)`` can update the parsed INI before
+    An optional ``prepare(ini_source)`` can update the parsed INI before
     shared decoding, for example to rebind calibration paths. The original
     source text remains available. After shared decoding succeeds, the
     optional ``decode(ini_source, base_config)`` returns an extended configuration.
@@ -614,8 +626,8 @@ def load_ao_configuration(
     caller.
     """
     ini_source = read_ini_source(path)
-    if prepare_ini is not None:
-        prepare_ini(ini_source)
+    if prepare is not None:
+        prepare(ini_source)
     base_config = Configuration.from_ini(
         ini_source.parser, ini_path=ini_source.path, load_pupil=load_pupil
     )
@@ -793,8 +805,7 @@ def _read_fitting(ini):
     )
 
 
-def _read_mirrors(ini):
-    section = "DM"
+def _read_mirrors(ini, section="DM"):
     counts = _vector(ini, section, "NumberActuators", u.one)
     pitches = _vector(ini, section, "DmPitchs", u.m)
     heights = _vector(ini, section, "DmHeights", u.m)
@@ -809,7 +820,9 @@ def _read_mirrors(ini):
         if values is not None
     }
     if len(lengths) > 1:
-        raise ValueError("[DM] actuator counts, pitches, heights and couplings must match")
+        raise ValueError(
+            f"[{section}] actuator counts, pitches, heights and couplings must match"
+        )
     if not lengths and model is None:
         return ()
 
@@ -818,7 +831,7 @@ def _read_mirrors(ini):
             actuator_count=(
                 None
                 if counts is None
-                else _integer(counts[index].value, "DM.NumberActuators")
+                else _integer(counts[index].value, f"{section}.NumberActuators")
             ),
             pitch=None if pitches is None else pitches[index],
             conjugate_height=None if heights is None else heights[index],
@@ -887,8 +900,7 @@ def _read_science_detector(ini):
     )
 
 
-def _read_loop(ini, stage):
-    section = "RTC"
+def _read_loop(ini, stage, section="RTC"):
     gain_key = f"LoopGain_{stage}"
     raw_gain = ini.get(section, gain_key, fallback="").strip()
     # A native gain policy leaves the shared fixed gain unspecified.

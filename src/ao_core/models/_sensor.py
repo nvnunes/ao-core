@@ -17,6 +17,12 @@ from ._centroid import (
     _legendre_nodes,
     clipped_normal_laplace,
 )
+from .optics import (
+    _coherence_from_variance_buffer,
+    _image_from_otf,
+    _phase_difference_variance_inplace,
+    _sum_pairs_by_lag,
+)
 
 
 class _CentroidMoments:
@@ -184,22 +190,19 @@ def optical_mean(pupil, covariance, derivative_modes=(), *, derivative_workers=1
         field[y, x] = amplitude * np.exp(1j * (pupil.ncpa - np.pi * (x + y) / size))
         return np.abs(fftshift(fft2(field))) ** 2 / normalization, []
 
-    phase = pupil.basis.T @ covariance @ pupil.basis
-    diagonal = np.diag(phase).copy()
-    phase *= -2
-    phase += diagonal[:, None] + diagonal[None]
-    phase *= -0.5
-    # NGS optics have zero static phase. Keep their pair weights real until
-    # after lag accumulation, avoiding dense complex arrays for every mode.
+    coherence = pupil.basis.T @ covariance @ pupil.basis
+    variance = coherence.diagonal().copy()
+    _phase_difference_variance_inplace(coherence, variance, variance)
+    # Zero static phase lets the pair weights remain real through lag accumulation.
     static_phase = np.any(pupil.ncpa)
-    if static_phase:
-        coherence = np.exp(phase + 1j * (pupil.ncpa[:, None] - pupil.ncpa[None]))
-    else:
-        np.exp(phase, out=phase)
-        coherence = phase
+    coherence = _coherence_from_variance_buffer(
+        coherence,
+        phase_exponent=1j * (pupil.ncpa[:, None] - pupil.ncpa[None])
+        if static_phase
+        else None,
+    )
     coherence *= amplitude[:, None]
     coherence *= amplitude[None]
-    del phase
     lag_ids = (y[:, None] - y) % size
     lag_ids *= size
     lag_ids += (x[:, None] - x) % size
@@ -211,15 +214,8 @@ def optical_mean(pupil, covariance, derivative_modes=(), *, derivative_workers=1
     centering = np.exp(-1j * np.pi * (frequency[:, None] + frequency[None]))
 
     def propagate(values, factor=1):
-        otf = np.bincount(lag_ids, weights=values.real.ravel(), minlength=size**2)
-        if np.iscomplexobj(values):
-            otf = otf + 1j * np.bincount(
-                lag_ids, weights=values.imag.ravel(), minlength=size**2
-            )
-        return (
-            fftshift(fft2(otf.reshape(size, size) * centering * factor)).real
-            / normalization
-        )
+        otf = _sum_pairs_by_lag(values, lag_ids, size**2).reshape(size, size)
+        return _image_from_otf(otf * centering * factor) / normalization
 
     image = propagate(coherence)
     if image.min() < -1e-12 or abs(image.sum() - 1) > 1e-10:
@@ -247,8 +243,10 @@ def optical_mean(pupil, covariance, derivative_modes=(), *, derivative_workers=1
             otf = accumulate(basis, coherence, y, x, size)
             # Reversing each pair flips its lag and the phase derivative.
             otf -= otf[opposite]
-            images = fft2(otf.T.reshape(-1, size, size) * centering * 1j)
-            return fftshift(images, axes=(-2, -1)).real / normalization
+            return (
+                _image_from_otf(otf.T.reshape(-1, size, size) * centering * 1j)
+                / normalization
+            )
 
         if derivative_workers == 1:
             derivatives = [

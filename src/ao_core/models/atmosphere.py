@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
+from astropy import units as u
 from scipy.special import gamma, kv
 
 __all__ = [
@@ -12,6 +15,29 @@ __all__ = [
 
 VK_COEFFICIENT = 0.022895587108555225
 _KOLMOGOROV_INDEX = 5 / 6
+
+
+def _project_zenith_atmosphere(atmosphere, angle):
+    """Apply caller zenith angle to vertical heights and turbulence strength.
+
+    See Eq. (1) for the conversion from Kolmogorov seeing to the
+    Fried parameter. [Martinez et al. (2010)](https://arxiv.org/pdf/1003.4593)
+    """
+    if atmosphere.reference_wavelength is None or atmosphere.layer_heights is None:
+        raise ValueError("Atmosphere requires reference_wavelength and layer_heights")
+    fried = atmosphere.fried_parameter
+    if atmosphere.seeing is not None:
+        fried = (
+            0.976 * atmosphere.reference_wavelength / atmosphere.seeing.to_value(u.rad)
+        )
+    if fried is None:
+        raise ValueError("Atmosphere requires Seeing or a Fried parameter")
+    airmass = 1.0 if angle is None else 1 / np.cos(angle.to_value(u.rad))
+    return replace(
+        atmosphere,
+        fried_parameter=fried * airmass ** (-3 / 5),
+        layer_heights=atmosphere.layer_heights * airmass,
+    ), airmass
 
 
 def von_karman_spectrum(

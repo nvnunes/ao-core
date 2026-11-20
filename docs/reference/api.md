@@ -77,6 +77,16 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - state_matrix
         - tip_tilt_feedback
 
+::: ao_core.models.ho_psf
+    options:
+      members:
+        - HoPsfConfiguration
+        - HoPsfModel
+        - HoPsfPrediction
+        - HoPsfRequest
+        - MirrorGeometry
+        - decode_ho_psf
+
 ::: ao_core.models.exposure
     options:
       members:

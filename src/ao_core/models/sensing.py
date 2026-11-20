@@ -31,6 +31,9 @@ def lgs_footprint_phase(fx, fy, layer_height, directions, *, cone=1.0, offsets=N
 
     Provide spatial frequencies in cycles/m, layer height and offsets in m,
     and directions in radians. The result is beacon by spatial frequency.
+
+    See Eqs. (7)–(8) and (18) for the footprint translation and its
+    Fourier phase. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
     """
     if offsets is None:
         return np.exp(

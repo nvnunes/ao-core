@@ -51,6 +51,9 @@ def wind_aligned_tilt_covariance(
     The result has shape (K, K) with K = 2 * n_directions * (1 + n_strengths).
     Each axis flattens (direction, unfiltered followed by each filtered channel,
     x/y), in that order. The continuous spectrum samples the periodic filter.
+
+    The transverse-frequency integral follows Eq. (43). Apply the
+    channel transfer functions to that cross-spectrum. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
     """
     _count(frequency_order, "frequency_order")
     _count(transverse_order, "transverse_order")

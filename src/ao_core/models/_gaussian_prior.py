@@ -13,6 +13,9 @@ def subtract_clip_moments(
     Poisson/read-noise sum below ten. Background is zero in this instrument model.
     All quantities use electrons. Read noise must be positive; excess applies to
     the Gaussian branch as in the reference implementation.
+
+    See Eqs. (32)–(33) for the clipped-normal mean and variance.
+    [Foi et al. (2008)](https://doi.org/10.1109/TIP.2008.2001399)
     """
     flux = np.asarray(flux, dtype=float)
     if (
@@ -182,6 +185,9 @@ def _subtract_clip_moments(flux: np.ndarray, threshold: float, ron: float):
     Match the native detector prior: Gaussian photon approximation at >=10
     photons/pixel, otherwise sum Poisson orders 0..29. Only the central 5-by-5
     mask is evaluated; pixels outside it cannot affect the centroid.
+
+    See Eqs. (32)–(33) for the clipped-normal mean and variance.
+    [Foi et al. (2008)](https://doi.org/10.1109/TIP.2008.2001399)
     """
     mean, second = np.zeros_like(flux), np.zeros_like(flux)
     bright = flux >= 10

@@ -212,6 +212,10 @@ def metric_covariance(lag, first, second, tails):
     Use the first, second and higher-order responses from phase_responses on
     the same pupil, modal basis and reference wavelength. The result has
     each metric's squared units.
+
+    See Theorem 1 for the derivatives with respect to Gaussian
+    cross-covariance that generate the expansion orders.
+    [Voigtlaender (2021)](https://arxiv.org/pdf/1710.03576v2)
     """
     total = np.einsum("mi,tij,mj->mt", first, lag, first)
     block_size = max(1, TEMPORAL_WORK_ELEMENTS // math.prod(lag.shape[1:]))

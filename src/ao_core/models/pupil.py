@@ -275,7 +275,12 @@ def make_pupil(
     *,
     fourier_response=True,
 ) -> ModalPupil:
-    """Keep native pupil/NCPA sampling; optionally omit unused Fourier projections."""
+    """Keep native pupil/NCPA sampling; optionally omit unused Fourier projections.
+
+    See the arbitrary-aperture Zernike orthogonalization for the basis
+    construction. Here the pupil intensity defines the inner product.
+    [Upton & Ellerbroek (2004)](https://doi.org/10.1364/OL.29.002840)
+    """
     coordinates = np.linspace(0, len(pupil) - 1, side)
     yy, xx = np.meshgrid(coordinates, coordinates, indexing="ij")
     amplitude = map_coordinates(

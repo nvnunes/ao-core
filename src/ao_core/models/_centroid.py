@@ -330,7 +330,11 @@ class DirectCentroid:
         return combined
 
     def _integrate(self, flux, *, jacobian=False, upper=None):
-        """Evaluate the same moment formulas on a half-line or finite interval."""
+        """Evaluate the same moment formulas on a half-line or finite interval.
+
+        See Eqs. (1.1)–(1.2) for the add-one difference used by the
+        photon-count Jacobian. [Last (2014)](https://arxiv.org/pdf/1203.3181)
+        """
         times, weights = self.times, self.weights
         conditional, differences = self.conditional, self.differences
         if upper is not None:

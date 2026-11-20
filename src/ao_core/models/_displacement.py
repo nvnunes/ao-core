@@ -12,7 +12,11 @@ def _covariance_root(covariance, inverse=False):
 
 
 def _empirical_otf(samples, pixel_mas, side, oversample=4):
-    """Positive CIC histogram with its assignment window removed in Fourier space."""
+    """Positive CIC histogram with its assignment window removed in Fourier space.
+
+    See Eq. (18) with p = 2 for the cloud-in-cell Fourier amplitude
+    window. [Jing (2005)](https://arxiv.org/pdf/astro-ph/0409240)
+    """
     fine = side * oversample
     xy = samples / (pixel_mas / oversample)
     ij = np.floor(xy).astype(np.int64)

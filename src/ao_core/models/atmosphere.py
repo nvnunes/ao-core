@@ -48,6 +48,9 @@ def von_karman_spectrum(
     Spatial frequencies are cycles per metre. The Fried parameter is specified
     at the wavelength used for the phase. Multiply by each layer's weight
     and by the area of its Fourier quadrature cell when forming covariance.
+
+    See Eq. (19) for the cycles-per-metre convention and spectrum
+    normalization. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
     """
     return (
         VK_COEFFICIENT
@@ -59,14 +62,21 @@ def von_karman_spectrum(
 def frozen_flow_frequency(
     fx: np.ndarray, fy: np.ndarray, speed_m_per_s: float, direction_rad: float
 ) -> np.ndarray:
-    """Project a translating layer onto Fourier frequencies in cycles per second."""
+    """Project a translating layer onto Fourier frequencies in cycles per second.
+
+    See Eqs. (30)–(32) for the signed frequency mapping. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
+    """
     return -speed_m_per_s * (np.cos(direction_rad) * fx + np.sin(direction_rad) * fy)
 
 
 def von_karman_correlation(
     distance_m: np.ndarray, inverse_outer_scale: float
 ) -> np.ndarray:
-    """Evaluate the unit-variance von Kármán phase correlation."""
+    """Evaluate the unit-variance von Kármán phase correlation.
+
+    See the von Kármán phase covariance for the Bessel-function form.
+    [Assémat et al. (2006)](https://doi.org/10.1364/OE.14.000988)
+    """
     nu = _KOLMOGOROV_INDEX
     z = 2 * np.pi * inverse_outer_scale * distance_m
     correlation = np.ones_like(z)

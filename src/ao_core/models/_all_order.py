@@ -133,7 +133,11 @@ class RemainderQuadrature:
         workers=1,
         reuse_draws=False,
     ):
-        """Use matched scrambled quartets at a single lag, returning fine and coarse estimates."""
+        """Use matched scrambled quartets at a single lag, returning fine and coarse estimates.
+
+        See the Sobol notes for the linear matrix scramble and digital
+        shift used for each replicate. [SciPy Sobol documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.qmc.Sobol.html)
+        """
         accumulate = quartet_accumulator()
         matrix, search = self.proposal, self.search
         count = 1 << power

@@ -19,7 +19,11 @@ def _lag_transform(bins, count, retained):
 
 
 def _lag_block(spectrum, count, retained):
-    """Use chirp-z for short windows with the irfft endpoint weights."""
+    """Use chirp-z for short windows with the irfft endpoint weights.
+
+    See Eqs. (7a)–(7c) for the chirp Z-transform sampling grid.
+    [Rabiner et al. (1969)](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/015_czt.pdf)
+    """
     if retained >= count // 4:
         return irfft(spectrum * count, n=count, axis=0)[:retained]
     positive = spectrum[: count // 2 + 1].copy()
@@ -82,6 +86,9 @@ def exposure_variance(
     Independent realizations are averaged with equal weight. The result uses
     the supplied metric covariance units. The frame interval is explicit so
     the same convention can be used to form fractional sampling coefficients.
+
+    See §3 for the equivalent frequency-domain variance of a
+    finite-duration average. [Males et al. (2021)](https://arxiv.org/pdf/2107.04604)
     """
     dt = float(frame_interval.to_value(u.s))
     if dt <= 0 or not np.isfinite(dt):

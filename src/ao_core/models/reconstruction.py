@@ -137,6 +137,9 @@ def lo_reconstructor(
     Css and C_eta are 2*N square; Cas(0,0) is 2 by 2*N. All covariances
     are supplied in mas². This solver preserves the noise-dependent amplitude
     of R without conditioning matrices or normalizing reconstructor blocks.
+
+    See Eq. (5) for the minimum-variance covariance solve used in
+    the multistar case. [Correia et al. (2018)](https://arxiv.org/pdf/1806.07938)
     """
     dtype = _input_dtype(css_mas2, dtype)
     css, cas, noise = [

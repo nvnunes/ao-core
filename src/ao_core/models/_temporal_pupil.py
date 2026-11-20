@@ -70,7 +70,10 @@ def _correction_lags(science, terms, indices, native_count):
 
 
 def atmospheric_offset_covariance(atmosphere, dt, offsets):
-    """Cache reference-wavelength offset vectors for one atmosphere and pupil grid."""
+    """Cache reference-wavelength offset vectors for one atmosphere and pupil grid.
+
+    See Eq. (26) for the frozen-flow displacement of the separation. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
+    """
     speed = atmosphere.wind_speeds.to_value(u.m / u.s)
     direction = atmosphere.wind_directions.to_value(u.rad)
     velocity = speed[:, None] * np.column_stack((np.cos(direction), np.sin(direction)))

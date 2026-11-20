@@ -95,6 +95,10 @@ class FieldCovariance:
     controller cadence. For common-only or instantaneous calculations,
     period=None prepares covariance
     without generating temporal bins.
+
+    The covariance uses the layer spectrum and modal cross-spectrum
+    from Eqs. (19) and (43). Eq. (42) gives the circular-pupil response
+    corresponding to the sampled modal transform. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
     """
 
     compact = False

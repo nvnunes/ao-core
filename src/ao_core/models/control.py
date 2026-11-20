@@ -603,6 +603,10 @@ def integrator_noise_lags(
     The two angular axes follow the input response. At positive lag k the
     row axis is at t+k and the column axis is at t. Reconstructed noise is
     independent between frames and the result retains its squared unit.
+
+    See Eq. (18.16) for the stationary state covariance and the
+    positive-lag propagation.
+    [Sargent & Stachurski, Dynamic Linear Economies](https://dle.quantecon.org/linear_models.html)
     """
     _count(count, "count")
     transition, stationary = _stationary_state(
@@ -737,7 +741,11 @@ def polc_transfer(
 
 
 def scalar_integrator_transfer(z_inverse, strength, gain, delay):
-    """Evaluate the delayed integrator at the supplied inverse delay phase."""
+    """Evaluate the delayed integrator at the supplied inverse delay phase.
+
+    See §6.A for the delayed-integrator denominator at unit feedback
+    strength. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
+    """
     return (
         gain * z_inverse**delay / (1 - z_inverse + gain * strength * z_inverse**delay)
     )

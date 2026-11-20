@@ -8,23 +8,23 @@ import numpy as np
 from astropy import units as u
 from numpy.polynomial.legendre import leggauss
 from scipy.fft import hfft2
-from scipy.ndimage import distance_transform_edt
-from scipy.signal import fftconvolve
 from scipy.special import j0
 
 from ._all_order import restored_covariance
 from ._exposure import atmospheric_lags
 from ._image_response import ContourOutsideCrop, contour_fwhm
+from ._lag_transfer import CubicLagTransfer
 from ._restored_pupil import FullScienceMean
 from ._temporal_pupil import atmospheric_offset_covariance, full_pupil_lags
 from .atmosphere import VK_COEFFICIENT, von_karman_correlation
+from .optics import (
+    _coherence_from_variance_buffer,
+    _pupil_autocorrelation,
+    _sum_pairs_by_lag,
+)
 from .pupil import CORRECTION_CUTOFF, raw_modes
 
 CONTOUR_REFINEMENT = 16
-
-
-def _autocorrelation(field):
-    return fftconvolve(field, field[::-1, ::-1].conj(), mode="full")
 
 
 def _project_out_tilt(matrix, tilt):
@@ -82,48 +82,47 @@ def _high_structure(side, spacing, atmosphere, scale):
     return result[inverse].reshape(side, side)
 
 
+def _hermitian_lags(lags):
+    return 0.5 * (lags + lags[..., ::-1, ::-1].conj())
+
+
 class StaticTransfer:
     """Transfer atmosphere-weighted optical lags onto the original map lattice."""
 
     def __init__(self, field, coarse_field, high):
-        self.coarse_static = _autocorrelation(coarse_field)
-        self.supported = abs(self.coarse_static) > 1e-8 * abs(self.coarse_static).max()
-        self.nearest = tuple(
-            distance_transform_edt(
-                ~self.supported, return_distances=False, return_indices=True
-            )
+        coarse_edge = len(coarse_field) - 1
+        self.side = 4 * coarse_edge
+        center = self.side // 2
+        self.window = slice(center - coarse_edge, center + coarse_edge + 1)
+        # Pad the signed lags so the periodic spline spans the unsupported margin.
+        coarse_static = np.zeros((self.side, self.side), dtype=complex)
+        coarse_static[self.window, self.window] = _pupil_autocorrelation(coarse_field)
+        native_edge = len(field) - 1
+        lags = np.arange(-native_edge, native_edge + 1)
+        self.transfer = CubicLagTransfer(
+            coarse_static, lags * coarse_edge / native_edge
         )
-        size = len(self.coarse_static)
-        target = np.linspace(0, size - 1, 2 * len(field) - 1)
-        left = np.minimum(target.astype(int), size - 2)
-        fraction = target - left
-        self.interpolation = np.zeros((len(target), size))
-        self.interpolation[np.arange(len(target)), left] = 1 - fraction
-        self.interpolation[np.arange(len(target)), left + 1] = fraction
-        lags = abs(np.arange(1 - len(field), len(field)))
-        self.native_factor = _autocorrelation(field) * np.exp(
+        lags = abs(lags)
+        self.native_factor = _pupil_autocorrelation(field) * np.exp(
             -0.5 * high[lags[:, None], lags]
         )
 
     def mean(self, coarse):
-        ratio = np.zeros_like(self.coarse_static)
-        ratio[self.supported] = (
-            coarse[self.supported] / self.coarse_static[self.supported]
-        )
-        matrix = self.interpolation
-        native = (matrix @ ratio[self.nearest] @ matrix.T) * self.native_factor
-        return 0.5 * (native + native[::-1, ::-1].conj())
+        padded = np.zeros((self.side, self.side), dtype=coarse.dtype)
+        padded[self.window, self.window] = coarse
+        return _hermitian_lags(self.transfer.forward(padded, self.native_factor))
 
     def responses(self, native):
         """Apply the static transfer adjoint to a batch of metric kernels."""
-        matrix = self.interpolation
-        pulled = matrix.T @ (native * self.native_factor) @ matrix
-        coarse = np.zeros(
-            (len(native), *self.coarse_static.shape), dtype=self.coarse_static.dtype
+        coarse = np.array(
+            [
+                self.transfer.adjoint(_hermitian_lags(kernel), self.native_factor)[
+                    self.window, self.window
+                ]
+                for kernel in native
+            ]
         )
-        np.add.at(coarse, (slice(None), *self.nearest), pulled)
-        coarse[:, self.supported] /= self.coarse_static[self.supported]
-        return 0.5 * (coarse + coarse[:, ::-1, ::-1].conj())
+        return _hermitian_lags(coarse)
 
 
 class CoreTransform:
@@ -356,11 +355,10 @@ class CompactScienceOptics:
         """Build the metric kernels from the restored structure on the compact pupil."""
         if self.tilt is not None:
             structure = _without_science_tilt(structure, self.tilt)
-        coherence = self.static_pairs * np.exp(-0.5 * (structure - self.high_pairs))
-        bins = self.coarse_lags**2
-        coarse = np.bincount(
-            self.flat_lag, coherence.real.ravel(), minlength=bins
-        ) + 1j * np.bincount(self.flat_lag, coherence.imag.ravel(), minlength=bins)
+        coherence = self.static_pairs * _coherence_from_variance_buffer(
+            structure - self.high_pairs
+        )
+        coarse = _sum_pairs_by_lag(coherence, self.flat_lag, self.coarse_lags**2)
         mean_otf = self.transfer.mean(
             coarse.reshape(self.coarse_lags, self.coarse_lags)
         )

@@ -233,7 +233,8 @@ def test_metal_quadratic_covariance_with_large_pupil():
 
 @pytest.fixture(scope="module")
 def sampling_reference():
-    # Pinned e011 CPU Fast at K and Gb, indices 55/95, 2/4 ms.
+    # Pinned e011 CPU Fast with linear optical transfer at K and Gb,
+    # indices 55/95, 2/4 ms.
     # Capture recipe: GIRMOS verification capture_public_sampling_reference.py.
     from pathlib import Path
 
@@ -323,7 +324,7 @@ def public_sampling_request(sampling_reference):
     )
 
 
-def test_public_sampling_predictor_matches_pinned_fields_and_preserves_order(
+def test_public_sampling_predictor_preserves_order_and_agrees_with_linear_reference(
     public_sampling_request,
     sampling_reference,
     monkeypatch,
@@ -379,18 +380,14 @@ def test_public_sampling_predictor_matches_pinned_fields_and_preserves_order(
                 / 100
             )
             unit = u.mas if name == "fwhm_mas" else u.one
-            np.testing.assert_allclose(
-                metric.mean.to_value(unit), expected[0], rtol=1e-10
-            )
-            np.testing.assert_allclose(
-                result.diagnostics.mean_by_exposure[name].to_value(unit),
-                expected,
-                rtol=1e-10,
-            )
-            np.testing.assert_allclose(
-                metric.coefficient.to_value(u.s**0.5), coefficient, rtol=1e-10
-            )
-            variance = (coefficient * expected) ** 2 / request.exposures.value[:, None]
+            means = result.diagnostics.mean_by_exposure[name].to_value(unit)
+            coefficients = metric.coefficient.to_value(u.s**0.5)
+            # The cubic optics shift the reference means by up to 0.54%
+            # and the fractional SD coefficients by up to 1.04%.
+            np.testing.assert_allclose(means, expected, rtol=0.006)
+            np.testing.assert_allclose(coefficients, coefficient, rtol=0.012)
+            np.testing.assert_allclose(metric.mean.to_value(unit), means[0], rtol=1e-10)
+            variance = (coefficients * means) ** 2 / request.exposures.value[:, None]
             np.testing.assert_allclose(
                 metric.variance.to_value(unit**2), variance, rtol=2e-10
             )
@@ -398,8 +395,8 @@ def test_public_sampling_predictor_matches_pinned_fields_and_preserves_order(
     single = replace(k, exposures=k.exposures[:1])
     prediction = predictor.predict(single)
     assert prediction.diagnostics is None
-    for index, name in enumerate(metrics):
-        expected = d["predicted_mean_0"][0, :, index]
+    for name in metrics:
+        expected = results[0].metrics[name].mean.value
         np.testing.assert_allclose(
             prediction.metrics[name].mean.value, expected, rtol=1e-10
         )

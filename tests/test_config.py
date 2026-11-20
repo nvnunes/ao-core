@@ -1,6 +1,7 @@
 """Check the shared INI behavior used by downstream loaders."""
 
 import ast
+from configparser import ConfigParser
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from ao_core.models.config import (
     read_ini,
     read_ini_array,
     read_ini_scalar,
+    read_ini_source,
     resolve_ini_path,
 )
 
@@ -33,8 +35,12 @@ Label = 50% transmission
     monkeypatch.chdir(tmp_path)
 
     source, ini = read_ini("instrument/system.ini")
+    document = read_ini_source("instrument/system.ini")
 
     assert source == path.resolve()
+    assert document.path == source
+    assert document.text == contents
+    assert dict(document.parser["telescope"]) == dict(ini["telescope"])
     telescope = ini["telescope"]
     assert dict(telescope) == dict(parse_ini(contents)["telescope"])
     assert "telescopediameter" not in telescope
@@ -55,6 +61,19 @@ def test_path_resolution_checks_required_files_only(tmp_path):
         "results/run.h5", source=source, label="output", must_exist=False
     )
     assert result == (tmp_path / "results/run.h5").resolve()
+
+
+def test_read_ini_source_uses_supplied_parser_policy(tmp_path):
+    path = tmp_path / "system.ini"
+    text = "# retain key spelling\n[hybrid]\nPrecision = float64\n"
+    path.write_text(text, encoding="utf-8")
+    parser = ConfigParser(interpolation=None)
+
+    source = read_ini_source(path, parser=parser)
+
+    assert source.parser is parser
+    assert parser["hybrid"]["precision"] == "float64"
+    assert source.text == text
 
 
 def test_numeric_literals_and_coordinate_convention():

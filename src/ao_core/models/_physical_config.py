@@ -1,11 +1,12 @@
 """Unit-aware physical inputs and their existing AO INI field names."""
 
 from ast import literal_eval
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from configparser import ConfigParser
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from numbers import Integral, Real
 from pathlib import Path
+from typing import Literal, Self, overload
 
 import numpy as np
 from astropy import units as u
@@ -13,10 +14,11 @@ from astropy.io import fits
 from scipy.ndimage import rotate, zoom
 
 from ._ini import (
+    IniSource,
     polar_to_cartesian,
-    read_ini,
     read_ini_array,
     read_ini_scalar,
+    read_ini_source,
     resolve_ini_path,
 )
 from ._sampling_grid import SamplingSettings
@@ -98,6 +100,11 @@ class TelescopeConfig:
         if self.pupil_resolution is not None:
             _count(self.pupil_resolution, "pupil_resolution", 1)
 
+    @classmethod
+    def from_ini(cls, parser: ConfigParser) -> "TelescopeConfig | None":
+        """Decode telescope metadata without opening pupil or aberration maps."""
+        return _read_telescope(parser)
+
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class AtmosphereConfig:
@@ -145,6 +152,11 @@ class AtmosphereConfig:
         if len({len(values) for values in layers if values is not None}) > 1:
             raise ValueError("Atmospheric layer vectors must have matching lengths")
 
+    @classmethod
+    def from_ini(cls, parser: ConfigParser) -> "AtmosphereConfig | None":
+        """Decode the shared atmosphere fields, retaining the supplied geometry."""
+        return _read_atmosphere(parser)
+
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class SourceConfig:
@@ -153,20 +165,80 @@ class SourceConfig:
     Directions contain sky-plane [x, y] pairs in arcseconds. Wavelengths are a
     vector in metres whose interpretation belongs to the selected model.
     Height is the supplied beacon height in metres, with zero representing a
-    source at infinity in the existing INI convention. Missing values are None.
+    source at infinity in the existing INI convention. The optional zenith
+    offsets (arcsec) and azimuths (degrees) retain the supplied polar
+    coordinates and determine the sky-plane directions. Missing values are None.
     """
 
     directions: u.Quantity | None = None
     wavelengths: u.Quantity | None = None
     height: u.Quantity | None = None
+    zenith: u.Quantity | None = None
+    azimuth: u.Quantity | None = None
 
     def __post_init__(self):
         _quantities(
-            self, directions=(u.arcsec, 2), wavelengths=(u.m, 1), height=(u.m, 0)
+            self, zenith=(u.arcsec, 1), azimuth=(u.deg, 1),
+            wavelengths=(u.m, 1), height=(u.m, 0),
         )
+        directions = self.directions
+        if (self.zenith is None) != (self.azimuth is None):
+            raise ValueError("Supply both zenith and azimuth for polar directions")
+        if self.zenith is not None:
+            x, y = polar_to_cartesian(self.zenith.value, self.azimuth.value)
+            polar_directions = np.column_stack((x, y)) * u.arcsec
+            if directions is None:
+                object.__setattr__(self, "directions", polar_directions)
+        _quantities(self, directions=(u.arcsec, 2))
         _xy_pairs(self.directions, "directions")
+        if (
+            self.zenith is not None
+            and directions is not None
+            and not np.array_equal(self.directions.value, polar_directions.value)
+        ):
+            raise ValueError("Cartesian directions must agree with zenith and azimuth")
         _positive(self, "wavelengths")
         _nonnegative(self, "height")
+
+    @classmethod
+    def from_ini(cls, parser: ConfigParser, section: str) -> "SourceConfig | None":
+        """Decode one source section and preserve its original polar coordinates."""
+        return _read_sources(parser, section)
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class DeformableMirrorConfig:
+    """Nominal parameters for one deformable mirror.
+
+    Attributes:
+        actuator_count: Number of actuator positions across the nominal grid.
+        pitch: Nominal actuator spacing in metres.
+        conjugate_height: Conjugation altitude in metres.
+        influence_model: Name of the influence function model.
+        influence_coupling: Dimensionless coupling between adjacent actuators.
+    """
+
+    actuator_count: int | None = None
+    pitch: u.Quantity | None = None
+    conjugate_height: u.Quantity | None = None
+    influence_model: str | None = None
+    influence_coupling: u.Quantity | None = None
+
+    def __post_init__(self):
+        _quantities(
+            self,
+            pitch=(u.m, 0),
+            conjugate_height=(u.m, 0),
+            influence_coupling=(u.one, 0),
+        )
+        _positive(self, "pitch")
+        _nonnegative(self, "influence_coupling")
+        if self.actuator_count is not None:
+            _count(self.actuator_count, "actuator_count", 1)
+        if self.influence_model is not None and (
+            not isinstance(self.influence_model, str) or not self.influence_model.strip()
+        ):
+            raise ValueError("influence_model must be a nonempty string")
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -236,9 +308,10 @@ class DetectorConfig:
     """Detector sampling and noise inputs used by the shared models.
 
     Pixel scale is in mas/pixel. Field of view is the side length in pixels
-    of the low-order detector window. Read noise and threshold are in
+    of the detector window or science image. Read noise and threshold are in
     electrons. Photons per frame is a vector of configured counts. The consuming model
-    interprets the counts in the context of its optical sampling.
+    interprets the counts in the context of its optical sampling. Low-order
+    lenslet counts are the configured number per pupil width for each sensor.
     """
 
     pixel_scale: u.Quantity | None = None
@@ -246,6 +319,7 @@ class DetectorConfig:
     read_noise: u.Quantity | None = None
     threshold: u.Quantity | None = None
     photons_per_frame: u.Quantity | None = None
+    lenslet_counts: u.Quantity | None = None
 
     def __post_init__(self):
         _quantities(
@@ -255,11 +329,22 @@ class DetectorConfig:
             read_noise=(u.electron, 0),
             threshold=(u.electron, 0),
             photons_per_frame=(u.photon, 1),
+            lenslet_counts=(u.one, 1),
         )
-        _positive(self, "pixel_scale", "field_of_view")
+        _positive(self, "pixel_scale", "field_of_view", "lenslet_counts")
         _nonnegative(self, "read_noise", "photons_per_frame")
         if self.field_of_view is not None and self.field_of_view.value % 1 != 0:
             raise ValueError("field_of_view must contain a whole number of pixels")
+
+    @classmethod
+    def low_order_from_ini(cls, parser: ConfigParser) -> "DetectorConfig | None":
+        """Decode shared detector and sampling fields from `[sensor_LO]`."""
+        return _read_low_order_detector(parser)
+
+    @classmethod
+    def science_from_ini(cls, parser: ConfigParser) -> "DetectorConfig | None":
+        """Decode shared detector sampling fields from `[sensor_science]`."""
+        return _read_science_detector(parser)
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -290,6 +375,13 @@ class LoopConfig:
     def frame_interval(self) -> u.Quantity | None:
         """Return the interval between controller frames in seconds, if specified."""
         return None if self.frame_rate is None else (1 / self.frame_rate).to(u.s)
+
+    @classmethod
+    def from_ini(
+        cls, parser: ConfigParser, *, stage: Literal["HO", "LO"]
+    ) -> "LoopConfig | None":
+        """Decode shared controller settings for the selected loop from `[RTC]`."""
+        return _read_loop(parser, stage)
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -369,6 +461,9 @@ class Configuration:
     Use an existing AO INI or construct the same records in memory. Supply
     resolved pupil data and the ordered NGS list as needed. The sampling
     uncertainty settings are shared by Fast, Balanced and Full.
+
+    ``mirrors`` holds nominal deformable mirror records in the order supplied
+    by the ``[DM]`` section. An empty tuple represents absent mirror inputs.
     """
 
     telescope: TelescopeConfig | None = None
@@ -377,6 +472,7 @@ class Configuration:
     low_order_sources: SourceConfig | None = None
     science_sources: SourceConfig | None = None
     fitting: FittingConfig | None = None
+    mirrors: tuple[DeformableMirrorConfig, ...] = ()
     high_order_lenslets: LensletConfig | None = None
     low_order_detector: DetectorConfig | None = None
     science_detector: DetectorConfig | None = None
@@ -389,6 +485,10 @@ class Configuration:
     def __post_init__(self):
         if self.pupil is not None and not isinstance(self.pupil, Pupil):
             raise TypeError("pupil must be a Pupil")
+        mirrors = tuple(self.mirrors)
+        if not all(isinstance(mirror, DeformableMirrorConfig) for mirror in mirrors):
+            raise TypeError("mirrors must contain DeformableMirrorConfig records")
+        object.__setattr__(self, "mirrors", mirrors)
         ngs = tuple(self.ngs)
         if not all(isinstance(star, NaturalGuideStar) for star in ngs):
             raise TypeError("ngs must contain NaturalGuideStar records")
@@ -398,31 +498,58 @@ class Configuration:
 
     @classmethod
     def from_ini(
-        cls, ini_parser: ConfigParser, *, ini_path: str | Path | None = None
+        cls,
+        ini_parser: ConfigParser,
+        *,
+        ini_path: str | Path | None = None,
+        load_pupil: bool = True,
     ) -> "Configuration":
         """Decode shared sections and sampling settings from a parsed INI.
 
         Pass the INI path returned by read_ini for relative telescope map
         paths. File-backed pupils use the configured diameter and resolution
         to determine pixel pitch. Atmospheric and beacon inputs retain their
-        supplied geometry. Complete the NGS data with with_updates().
+        supplied geometry. Set `load_pupil=False` when the caller supplies
+        the pupil separately or only needs INI metadata. Complete the NGS
+        data with with_updates().
         """
-        telescope = _read_telescope(ini_parser)
+        telescope_config = TelescopeConfig.from_ini(ini_parser)
         return cls(
-            telescope=telescope,
-            atmosphere=_read_atmosphere(ini_parser),
-            high_order_sources=_read_sources(ini_parser, "sources_HO"),
-            low_order_sources=_read_sources(ini_parser, "sources_LO"),
-            science_sources=_read_sources(ini_parser, "sources_science"),
+            telescope=telescope_config,
+            atmosphere=AtmosphereConfig.from_ini(ini_parser),
+            high_order_sources=SourceConfig.from_ini(ini_parser, "sources_HO"),
+            low_order_sources=SourceConfig.from_ini(ini_parser, "sources_LO"),
+            science_sources=SourceConfig.from_ini(ini_parser, "sources_science"),
             fitting=_read_fitting(ini_parser),
-            high_order_lenslets=_read_lenslets(ini_parser, telescope),
-            low_order_detector=_read_low_order_detector(ini_parser),
-            science_detector=_read_science_detector(ini_parser),
-            high_order_loop=_read_loop(ini_parser, "HO"),
-            low_order_loop=_read_loop(ini_parser, "LO"),
-            pupil=_read_pupil(ini_parser, ini_path, telescope),
+            mirrors=_read_mirrors(ini_parser),
+            high_order_lenslets=_read_lenslets(ini_parser, telescope_config),
+            low_order_detector=DetectorConfig.low_order_from_ini(ini_parser),
+            science_detector=DetectorConfig.science_from_ini(ini_parser),
+            high_order_loop=LoopConfig.from_ini(ini_parser, stage="HO"),
+            low_order_loop=LoopConfig.from_ini(ini_parser, stage="LO"),
+            pupil=(
+                _read_pupil(ini_parser, ini_path, telescope_config) if load_pupil else None
+            ),
             sampling_uncertainty_model=SamplingSettings._from_ini(ini_parser),
         )
+
+    @classmethod
+    def from_config(cls, config: "Configuration", /, **extension_fields: object) -> Self:
+        """Construct a config subtype with the existing fields and new values.
+
+        Pass an instance of a base class of ``cls`` and the added fields for
+        the target type. Constructor fields retain their existing resolved
+        values. The target constructor validates the result and rejects
+        repeated or unknown field names.
+        """
+        if not isinstance(config, Configuration) or not issubclass(cls, type(config)):
+            raise TypeError(
+                "The target configuration type must extend the supplied configuration"
+            )
+        inherited = {
+            item.name: getattr(config, item.name) for item in fields(config) if item.init
+        }
+        return cls(**inherited, **extension_fields)
 
     def with_updates(
         self,
@@ -430,11 +557,11 @@ class Configuration:
         ngs: Iterable[NaturalGuideStar] | None = None,
         zenith_angle: u.Quantity | None = None,
         pupil: Pupil | None = None,
-    ) -> "Configuration":
+    ) -> Self:
         """Return a validated configuration with the supplied calculation inputs.
 
         Omitted inputs and None retain their values. An empty NGS sequence
-        clears the guide-star collection.
+        clears the guide-star collection. Subtypes retain their added fields.
         """
         telescope = self.telescope
         if zenith_angle is not None:
@@ -449,10 +576,55 @@ class Configuration:
         )
 
 
-def load_ao_configuration(path: str | Path) -> Configuration:
-    """Read a shared AO configuration and resolve its telescope map paths."""
-    ini_path, ini_parser = read_ini(path)
-    return Configuration.from_ini(ini_parser, ini_path=ini_path)
+@overload
+def load_ao_configuration(
+    path: str | Path,
+    *,
+    prepare_ini: Callable[[IniSource], None] | None = None,
+    load_pupil: bool = True,
+    decode: None = None,
+) -> Configuration: ...
+
+
+@overload
+def load_ao_configuration[T: Configuration](
+    path: str | Path,
+    *,
+    prepare_ini: Callable[[IniSource], None] | None = None,
+    load_pupil: bool = True,
+    decode: Callable[[IniSource, Configuration], T],
+) -> T: ...
+
+
+def load_ao_configuration(
+    path: str | Path,
+    *,
+    prepare_ini: Callable[[IniSource], None] | None = None,
+    load_pupil: bool = True,
+    decode: Callable[[IniSource, Configuration], Configuration] | None = None,
+) -> Configuration:
+    """Read one AO INI and decode its shared configuration once.
+
+    An optional ``prepare_ini(ini_source)`` can update the parsed INI before
+    shared decoding, for example to rebind calibration paths. The original
+    source text remains available. After shared decoding succeeds, the
+    optional ``decode(ini_source, base_config)`` returns an extended configuration.
+    The shared configuration is returned when ``decode`` is omitted. Set
+    ``load_pupil=False`` to leave pupil construction or map loading to the
+    caller.
+    """
+    ini_source = read_ini_source(path)
+    if prepare_ini is not None:
+        prepare_ini(ini_source)
+    base_config = Configuration.from_ini(
+        ini_source.parser, ini_path=ini_source.path, load_pupil=load_pupil
+    )
+    if decode is None:
+        return base_config
+    extended_config = decode(ini_source, base_config)
+    if not isinstance(extended_config, Configuration):
+        raise TypeError("decode must return a Configuration or a subtype")
+    return extended_config
 
 
 def _telescope_map_path(section, key, ini_path):
@@ -526,10 +698,13 @@ def _scalar(ini, section, key, unit):
     return None
 
 
-def _vector(ini, section, key, unit):
+def _vector(ini, section, key, unit, *, allow_empty=False):
     if section in ini and key in ini[section]:
-        values = ini[section]
-        return read_ini_array(values, key, label=f"{section}.{key}") * unit
+        values = read_ini_array(
+            ini[section], key, label=f"{section}.{key}", allow_empty=allow_empty
+        )
+        if values.size:
+            return values * unit
     return None
 
 
@@ -544,13 +719,18 @@ def _optional_integer(ini, section, key):
     return None if value is None else _integer(value.value, f"{section}.{key}")
 
 
-def _directions(ini, section, zenith, azimuth):
-    radius = _vector(ini, section, zenith, u.arcsec)
-    angle = _vector(ini, section, azimuth, u.deg)
-    if radius is None and angle is None:
-        return None
-    if radius is None or angle is None:
+def _polar_directions(ini, section, zenith, azimuth):
+    radius = _vector(ini, section, zenith, u.arcsec, allow_empty=True)
+    angle = _vector(ini, section, azimuth, u.deg, allow_empty=True)
+    if (radius is None) != (angle is None):
         raise ValueError(f"[{section}] requires both {zenith} and {azimuth}")
+    return radius, angle
+
+
+def _directions(ini, section, zenith, azimuth):
+    radius, angle = _polar_directions(ini, section, zenith, azimuth)
+    if radius is None:
+        return None
     x, y = polar_to_cartesian(radius.value, angle.value)
     return np.column_stack((x, y)) * u.arcsec
 
@@ -595,9 +775,11 @@ def _read_atmosphere(ini):
 
 
 def _read_sources(ini, section):
+    radius, angle = _polar_directions(ini, section, "Zenith", "Azimuth")
     return _present(
         SourceConfig,
-        directions=_directions(ini, section, "Zenith", "Azimuth"),
+        zenith=radius,
+        azimuth=angle,
         wavelengths=_vector(ini, section, "Wavelength", u.m),
         height=_scalar(ini, section, "Height", u.m),
     )
@@ -608,6 +790,42 @@ def _read_fitting(ini):
         FittingConfig,
         directions=_directions(ini, "DM", "OptimizationZenith", "OptimizationAzimuth"),
         weights=_vector(ini, "DM", "OptimizationWeight", u.one),
+    )
+
+
+def _read_mirrors(ini):
+    section = "DM"
+    counts = _vector(ini, section, "NumberActuators", u.one)
+    pitches = _vector(ini, section, "DmPitchs", u.m)
+    heights = _vector(ini, section, "DmHeights", u.m)
+    couplings = _vector(ini, section, "InfCoupling", u.one)
+    model = ini.get(section, "InfModel", fallback=None)
+    if model and model[0] in ("'", '"') and model[-1] == model[0]:
+        model = model[1:-1]
+
+    lengths = {
+        len(values)
+        for values in (counts, pitches, heights, couplings)
+        if values is not None
+    }
+    if len(lengths) > 1:
+        raise ValueError("[DM] actuator counts, pitches, heights and couplings must match")
+    if not lengths and model is None:
+        return ()
+
+    return tuple(
+        DeformableMirrorConfig(
+            actuator_count=(
+                None
+                if counts is None
+                else _integer(counts[index].value, "DM.NumberActuators")
+            ),
+            pitch=None if pitches is None else pitches[index],
+            conjugate_height=None if heights is None else heights[index],
+            influence_model=model,
+            influence_coupling=None if couplings is None else couplings[index],
+        )
+        for index in range(next(iter(lengths), 1))
     )
 
 
@@ -657,6 +875,7 @@ def _read_low_order_detector(ini):
         read_noise=_scalar(ini, section, "SigmaRON", u.electron),
         threshold=_scalar(ini, section, "ThresholdWCoG", u.electron),
         photons_per_frame=_vector(ini, section, "NumberPhotons", u.photon),
+        lenslet_counts=_vector(ini, section, "NumberLenslets", u.one),
     )
 
 
@@ -664,6 +883,7 @@ def _read_science_detector(ini):
     return _present(
         DetectorConfig,
         pixel_scale=_scalar(ini, "sensor_science", "PixelScale", u.mas / u.pix),
+        field_of_view=_scalar(ini, "sensor_science", "FieldOfView", u.pix),
     )
 
 

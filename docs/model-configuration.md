@@ -44,8 +44,9 @@ system = Configuration(
 ```
 
 Both paths store supplied quantities in the calculation units listed in the
-[Python reference](reference/api.md). Omitted groups and fields are `None`.
-Callers determine the inputs and defaults required by their model.
+[Python reference](reference/api.md). Omitted optional records and fields are
+`None`. The mirror tuple is empty when there are no mirror inputs. Callers
+determine the inputs and defaults required by their model.
 
 - `[atmosphere] Wavelength` defines the phase reference. Source wavelengths
   remain separate. Layer heights, wind directions and turbulence weights
@@ -57,17 +58,77 @@ Callers determine the inputs and defaults required by their model.
   keys stay available to native readers.
 - Source positions and DM fitting directions use sky-plane `[x, y]` pairs
   in arcseconds. INI azimuth increases from positive x toward positive y.
+  Source records also retain the supplied zenith offsets and azimuths.
   Callers apply any projection their calculations require.
 - `[sensor_HO] GridOffsets` uses lenslet-pitch units in the INI. The reader
   returns physical `[x, y]` offsets in metres using `SizeLenslets` or the
   telescope diameter divided by `NumberLenslets`. Add the offsets to the
   nominal lenslet positions.
-- Detector inputs include sampling and noise. Loop inputs include scalar
+- Detector inputs include sampling and noise. The low-order detector also
+  exposes `NumberLenslets` per sensor. Loop inputs include scalar
   gain and frame rate, delay in frames, and the corresponding frame interval.
   A native low-order gain policy such as `optimize` leaves the numeric gain
   unspecified. The original policy stays available in the INI parser.
+- `[sensor_science] PixelScale` and `FieldOfView` give the science sampling
+  in mas per pixel and the image side length in pixels.
+- `[DM]` supplies `NumberActuators`, `DmPitchs`, `DmHeights`, `InfModel`,
+  and `InfCoupling` to `Configuration.mirrors` in INI order. The reader
+  applies one influence model name to the listed mirrors. Supplied numeric
+  vectors have one value per mirror. The existing `[DM] Optimization*`
+  fields supply the separate fitting directions and weights.
+
+## Extending Configuration
+
+Pass a decoder to `load_ao_configuration()` when a model or application
+needs additional fields from the same INI. The loader decodes the shared
+`Configuration` once, then passes it and the parsed source to the decoder.
+
+```python
+from dataclasses import dataclass
+
+from ao_core.models.config import (
+    Configuration,
+    IniSource,
+    load_ao_configuration,
+    read_ini_scalar,
+)
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class ReconstructionConfig(Configuration):
+    regularization: float
+
+
+def decode_reconstruction(source: IniSource, config: Configuration) -> ReconstructionConfig:
+    regularization = read_ini_scalar(
+        source.parser["sensor_HO"],
+        "ReconstructionRegularization",
+        label="sensor_HO.ReconstructionRegularization",
+    )
+    return ReconstructionConfig.from_config(config, regularization=regularization)
+
+
+config = load_ao_configuration("system.ini", decode=decode_reconstruction)
+```
+
+`config.telescope` and `config.regularization` are both available on the
+returned object. A further decoder can extend `ReconstructionConfig` using
+its own subtype's `from_config()` method. Each extension supplies its added
+fields and carries forward the resolved values from the preceding config.
+
+Use `prepare_ini(source)` to update the parser before shared decoding, for
+example to bind an archived pupil path to its retained file. File references
+are resolved relative to `source.path`. The original INI text remains in
+`source.text` for provenance.
+
+Set `load_pupil=False` when another provider supplies the pupil. The loader
+still decodes the shared INI metadata and passes it to the extension.
 
 ## Reusing a Parsed INI
+
+Use a record decoder such as `TelescopeConfig.from_ini(parser)` or
+`SourceConfig.from_ini(parser, "sources_science")` when a consumer needs
+one group of shared fields from an already parsed INI.
 
 Call `read_ini` once when a consumer needs physical and application fields
 from the same file. It returns the resolved source path and the
@@ -84,3 +145,8 @@ system = Configuration.from_ini(ini_parser, ini_path=ini_path)
 numeric values. `resolve_ini_path` resolves a file path relative to the
 source INI. `ini_to_mapping` builds an owned mapping for a downstream
 consumer using a decoder supplied by the caller.
+
+Use `read_ini_source()` when a caller also needs the original text. For an
+already parsed effective INI, pass its parser and source path to
+`Configuration.from_ini()`. An `IniSource` built from those values can be
+passed directly to an extension decoder with the resulting configuration.

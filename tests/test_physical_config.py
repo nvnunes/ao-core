@@ -1,6 +1,7 @@
 """Check equivalent physical input records from files and quantities."""
 
-from dataclasses import fields
+from dataclasses import dataclass, fields
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from astropy.io import fits
 from ao_core.models.config import (
     AtmosphereConfig,
     Configuration,
+    DeformableMirrorConfig,
     DetectorConfig,
     FittingConfig,
     LensletConfig,
@@ -79,6 +81,7 @@ NumberPhotons = [80, 100]
 
 [sensor_science]
 PixelScale = 5
+FieldOfView = 512
 
 [RTC]
 LoopGain_HO = 0.3
@@ -112,15 +115,20 @@ LoopDelaySteps_LO = 1
             wind_directions=[0, np.pi / 2] * u.rad,
         ),
         high_order_sources=SourceConfig(
-            directions=[[30, 0], [0, 30]] * u.arcsec,
+            zenith=[30, 30] * u.arcsec,
+            azimuth=[0, 90] * u.deg,
             wavelengths=[589] * u.nm,
             height=90 * u.km,
         ),
         low_order_sources=SourceConfig(
-            directions=[[-10, 0], [0, -15]] * u.arcsec, wavelengths=[710] * u.nm
+            zenith=[10, 15] * u.arcsec,
+            azimuth=[180, 270] * u.deg,
+            wavelengths=[710] * u.nm,
         ),
         science_sources=SourceConfig(
-            directions=[[0, 0]] * u.arcsec, wavelengths=[1.65, 2.2] * u.um
+            zenith=[0] * u.arcsec,
+            azimuth=[0] * u.deg,
+            wavelengths=[1.65, 2.2] * u.um,
         ),
         fitting=FittingConfig(
             directions=[[0, 0], [-20, 0]] * u.arcsec, weights=[2, 1] * u.one
@@ -137,7 +145,9 @@ LoopDelaySteps_LO = 1
             threshold=0.5 * u.electron,
             photons_per_frame=[80, 100] * u.photon,
         ),
-        science_detector=DetectorConfig(pixel_scale=5 * u.mas / u.pix),
+        science_detector=DetectorConfig(
+            pixel_scale=5 * u.mas / u.pix, field_of_view=512 * u.pix
+        ),
         high_order_loop=LoopConfig(
             gain=0.3 * u.one, frame_rate=0.5 * u.kHz, delay_frames=1.7
         ),
@@ -174,6 +184,166 @@ LoopDelaySteps_LO = 1
     assert parsed["telescope"]["PathPupil"] == "pupil.fits"
 
 
+@dataclass(frozen=True, kw_only=True, eq=False)
+class ModelConfig(Configuration):
+    regularization: float
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class RunConfig(ModelConfig):
+    precision: str
+
+
+@pytest.mark.parametrize("extended", [False, True])
+def test_loader_decodes_shared_inputs_once_and_extends_in_order(
+    tmp_path, monkeypatch, extended
+):
+    path = tmp_path / "system.ini"
+    text = (
+        "[telescope]\nTelescopeDiameter = 8\n"
+        "[sensor_HO]\nReconstructionRegularization = 0.1\n"
+        "[hybrid]\nprecision = float64\n"
+    )
+    path.write_text(text, encoding="utf-8")
+    events = []
+    seen_parsers = []
+    read_text = Path.read_text
+    from_ini = Configuration.from_ini
+
+    def track_read(source_path, *args, **kwargs):
+        assert source_path == path.resolve()
+        events.append("read")
+        return read_text(source_path, *args, **kwargs)
+
+    def track_shared_decode(parser, *, ini_path, load_pupil):
+        events.append("shared")
+        seen_parsers.append(parser)
+        return from_ini(parser, ini_path=ini_path, load_pupil=load_pupil)
+
+    def decode_model(source, base):
+        events.append("model")
+        assert source.path == path.resolve()
+        assert source.text == text
+        assert source.parser is seen_parsers[0]
+        assert base.telescope.diameter == 8 * u.m
+        regularization = source.parser.getfloat("sensor_HO", "ReconstructionRegularization")
+        return ModelConfig.from_config(base, regularization=regularization)
+
+    def decode_run(source, base):
+        model_config = decode_model(source, base)
+        events.append("run")
+        return RunConfig.from_config(
+            model_config, precision=source.parser["hybrid"]["precision"]
+        )
+
+    monkeypatch.setattr(Path, "read_text", track_read)
+    monkeypatch.setattr(Configuration, "from_ini", staticmethod(track_shared_decode))
+    if extended:
+        result = load_ao_configuration(path, decode=decode_run)
+        assert events == ["read", "shared", "model", "run"]
+        assert result.regularization == 0.1
+        assert result.precision == "float64"
+        updated = result.with_updates(zenith_angle=20 * u.deg)
+        assert type(updated) is RunConfig
+        assert updated.telescope.zenith_angle == 20 * u.deg
+        assert updated.regularization == result.regularization
+        assert updated.precision == result.precision
+    else:
+        result = load_ao_configuration(path)
+        assert events == ["read", "shared"]
+        assert type(result) is Configuration
+    assert result.telescope.diameter == 8 * u.m
+
+
+def test_loader_rebinds_relative_pupil_before_decoding(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    path = config_dir / "system.ini"
+    text = "[telescope]\nTelescopeDiameter = 8\nResolution = 4\nPathPupil = archived.fits\n"
+    path.write_text(text, encoding="utf-8")
+    amplitude = np.arange(16, dtype=float).reshape(4, 4)
+    fits.writeto(config_dir / "retained.fits", amplitude)
+    monkeypatch.chdir(tmp_path)
+
+    def prepare(source):
+        source.parser["telescope"]["PathPupil"] = "retained.fits"
+
+    def decode(source, config):
+        assert source.text == text
+        assert source.parser["telescope"]["PathPupil"] == "retained.fits"
+        np.testing.assert_array_equal(config.pupil.amplitude, amplitude)
+        return ModelConfig.from_config(config, regularization=0.1)
+
+    with pytest.raises(FileNotFoundError, match=r"telescope\.PathPupil"):
+        load_ao_configuration(
+            "config/system.ini", decode=lambda *_: pytest.fail("decoded early")
+        )
+    result = load_ao_configuration(
+        "config/system.ini", prepare_ini=prepare, decode=decode
+    )
+    assert isinstance(result, ModelConfig)
+    assert result.pupil.pitch == 2 * u.m
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_configuration_extension_rejects_field_replacement_and_erasure():
+    config = Configuration(telescope=TelescopeConfig(diameter=8 * u.m))
+    with pytest.raises(TypeError, match="telescope"):
+        ModelConfig.from_config(config, telescope=None, regularization=0.1)
+    model_config = ModelConfig.from_config(config, regularization=0.1)
+    assert model_config.telescope is config.telescope
+    with pytest.raises(TypeError, match="must extend"):
+        Configuration.from_config(model_config)
+
+
+def test_loader_requires_decoder_to_return_a_configuration(tmp_path):
+    path = tmp_path / "system.ini"
+    path.write_text("[telescope]\nTelescopeDiameter = 8\n", encoding="utf-8")
+    with pytest.raises(TypeError, match="decode must return a Configuration"):
+        load_ao_configuration(path, decode=lambda source, config: object())
+
+
+def test_ini_decodes_nominal_mirrors_in_order():
+    config = Configuration.from_ini(
+        parse_ini(
+            "[DM]\nNumberActuators = [32, 17]\nDmPitchs = [0.25, 0.5]\n"
+            "DmHeights = [0, 11800]\nInfModel = 'gaussian'\nInfCoupling = [0.25, 0.3]\n"
+            "[DM_science]\nNumberActuators = [21]"
+        )
+    )
+    direct = (
+        DeformableMirrorConfig(
+            actuator_count=32,
+            pitch=25 * u.cm,
+            conjugate_height=0 * u.km,
+            influence_model="gaussian",
+            influence_coupling=25 * u.percent,
+        ),
+        DeformableMirrorConfig(
+            actuator_count=17,
+            pitch=50 * u.cm,
+            conjugate_height=11.8 * u.km,
+            influence_model="gaussian",
+            influence_coupling=30 * u.percent,
+        ),
+    )
+    for loaded, expected in zip(config.mirrors, direct, strict=True):
+        for item in fields(expected):
+            actual_value = getattr(loaded, item.name)
+            expected_value = getattr(expected, item.name)
+            assert actual_value == expected_value
+            if isinstance(actual_value, u.Quantity):
+                assert actual_value.unit == expected_value.unit
+
+    partial = Configuration.from_ini(parse_ini("[DM]\nDmHeights = 0"))
+    assert len(partial.mirrors) == 1
+    assert partial.mirrors[0].conjugate_height == 0 * u.m
+    assert partial.mirrors[0].actuator_count is None
+    assert Configuration.from_ini(
+        parse_ini("[DM]\nNumberReconstructedLayers = 7")
+    ).mirrors == ()
+
+
 def test_partial_inputs_and_derived_pitch():
     config = Configuration.from_ini(
         parse_ini(
@@ -195,6 +365,29 @@ def test_partial_inputs_and_derived_pitch():
     assert config.science_detector is None
 
 
+def test_metadata_load_keeps_polar_coordinates_and_leaves_pupil_to_caller(tmp_path):
+    path = tmp_path / "system.ini"
+    path.write_text(
+        "[telescope]\nTelescopeDiameter = 8\nPathPupil = unavailable.fits\n"
+        "[sources_HO]\nZenith = []\nAzimuth = []\n"
+        "[sources_LO]\nZenith = [0, 10]\nAzimuth = [-20, 360]\n"
+        "[sensor_LO]\nNumberLenslets = [1, 2]\n"
+    )
+    system_config = load_ao_configuration(path, load_pupil=False)
+    assert system_config.pupil is None
+    assert system_config.high_order_sources is None
+    np.testing.assert_array_equal(system_config.low_order_sources.zenith.value, [0, 10])
+    np.testing.assert_array_equal(system_config.low_order_sources.azimuth.value, [-20, 360])
+    np.testing.assert_allclose(
+        system_config.low_order_sources.directions.value, [[0, 0], [10, 0]], atol=1e-14
+    )
+    np.testing.assert_array_equal(
+        system_config.low_order_detector.lenslet_counts.value, [1, 2]
+    )
+    with pytest.raises(FileNotFoundError, match="PathPupil"):
+        load_ao_configuration(path)
+
+
 def test_direct_inputs_own_the_layer_values():
     heights = [0, 1800] * u.m
     atmosphere = AtmosphereConfig(layer_heights=heights)
@@ -211,6 +404,12 @@ def test_direct_inputs_own_the_layer_values():
         ("[atmosphere]\nCn2Heights = [0, 500]\nWindSpeed = 4", "matching lengths"),
         ("[RTC]\nLoopDelaySteps_LO = -1.5", "must be finite and nonnegative"),
         ("[sensor_HO]\nGridOffsets = [[0.1, 0.1]]", "requires a shared pitch"),
+        ("[sensor_science]\nFieldOfView = 10.5", "whole number of pixels"),
+        ("[DM]\nNumberActuators = 10.5", r"DM\.NumberActuators must be an integer"),
+        (
+            "[DM]\nNumberActuators = [32, 17]\nDmHeights = [0]",
+            r"\[DM\].*must match",
+        ),
     ],
 )
 def test_ini_rejects_inconsistent_physical_fields(text, message):

@@ -33,8 +33,10 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
       members:
         - Configuration
         - AtmosphereConfig
+        - DeformableMirrorConfig
         - DetectorConfig
         - FittingConfig
+        - IniSource
         - LensletConfig
         - LoopConfig
         - NaturalGuideStar
@@ -48,6 +50,7 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - read_ini
         - read_ini_array
         - read_ini_scalar
+        - read_ini_source
         - resolve_ini_path
 
 ::: ao_core.models.atmosphere

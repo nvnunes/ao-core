@@ -25,14 +25,18 @@ from ._units import (
 
 __all__ = [
     "FixedGainIntegrator",
+    "ScalarFeedback",
+    "TipTiltControl",
     "filter_input",
     "integrator_noise_covariance",
     "integrator_noise_lags",
     "integrator_transition",
     "polc_transfer",
+    "reconstructed_noise_covariance",
     "scalar_filter",
     "settling_cut",
     "state_matrix",
+    "tip_tilt_feedback",
 ]
 
 
@@ -171,6 +175,318 @@ class FixedGainIntegrator(_PhysicalRecord):
             )
             * u.mas**2
         )
+
+
+def _real_array(values: NDArray, name: str) -> NDArray:
+    """Check a numerical input and promote integers before matrix arithmetic."""
+    if isinstance(values, u.Quantity):
+        raise TypeError(
+            f"{name} must be a numerical array with units already converted"
+        )
+    array = np.asarray(values)
+    if array.dtype.kind in "iu":
+        return array.astype(np.float64)
+    dtype = array.dtype.newbyteorder("=")
+    if dtype not in (np.float32, np.float64) or not np.isfinite(array).all():
+        raise ValueError(f"{name} must be finite real values in float32 or float64")
+    return array.astype(dtype, copy=False)
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class ScalarFeedback:
+    """Two real scalar responses for filtering correlated tilt signals.
+
+    Attributes:
+        effective_feedback: Dimensionless feedback matrix of shape (2, 2).
+        strengths: Two dimensionless eigenvalues of the effective feedback.
+        projectors: Corresponding (2, 2) projectors in eigenvalue order.
+        symmetric_fallback: Whether the effective matrix is the symmetric part
+            of the actual feedback.
+        approximation_relative_error: Relative matrix-norm difference between
+            effective and actual feedback.
+        eigenbasis_condition: Condition number of the effective eigenbasis.
+    """
+
+    effective_feedback: NDArray
+    strengths: NDArray
+    projectors: NDArray
+    symmetric_fallback: bool
+    approximation_relative_error: float
+    eigenbasis_condition: float
+
+    def __post_init__(self) -> None:
+        for name, shape in (
+            ("effective_feedback", (2, 2)),
+            ("strengths", (2,)),
+            ("projectors", (2, 2, 2)),
+        ):
+            values = _real_array(getattr(self, name), name)
+            if values.shape != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+            immutable = np.frombuffer(values.tobytes(), dtype=values.dtype)
+            object.__setattr__(self, name, immutable.reshape(values.shape))
+        if type(self.symmetric_fallback) not in (bool, np.bool_) or any(
+            not np.isfinite(value) or value < 0
+            for value in (self.approximation_relative_error, self.eigenbasis_condition)
+        ):
+            raise ValueError("invalid scalar feedback diagnostics")
+
+    def __getattribute__(self, name):
+        value = object.__getattribute__(self, name)
+        return value.view() if isinstance(value, np.ndarray) else value
+
+    def validate(self, feedback: NDArray) -> None:
+        """Check that the stored projectors resolve the declared feedback.
+
+        Comparisons account for the precision of the stored decomposition and
+        the actual feedback. An exact cast to a wider dtype is valid.
+
+        Args:
+            feedback: Numerical dimensionless feedback of shape (2, 2).
+
+        Raises:
+            ValueError: If the effective matrix, strengths or projectors
+                disagree with the actual feedback and fallback choice.
+        """
+        _validate_scalar_decomposition(
+            feedback,
+            self.effective_feedback,
+            self.strengths,
+            self.projectors,
+            self.symmetric_fallback,
+        )
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class TipTiltControl(_PhysicalRecord):
+    """Prepare the closed-loop tip–tilt response for one NGS asterism.
+
+    The actual feedback is the sum of the reconstructor blocks weighted by
+    their sensing gains. If the maximum absolute imaginary part of its
+    eigenvalues exceeds 1e-10, the scalar signal filters use its symmetric
+    part. Both feedback matrices must give a stable loop. A defective or
+    ill-conditioned scalar decomposition raises ValueError. Measurement
+    noise propagates through the actual feedback matrix.
+
+    Attributes:
+        reconstructor: Dimensionless weights of shape (2, 2*N), with x/y
+            measurements interleaved by star and outputs in x/y order.
+        sensing_gains: One dimensionless tilt response per star, in NGS order.
+        controller: Fixed-gain integrator providing gain, delay and precision.
+        feedback: Actual, dimensionless two-axis feedback matrix.
+        scalar_feedback: Scalar strengths and projectors for signal filtering.
+    """
+
+    reconstructor: u.Quantity
+    sensing_gains: u.Quantity
+    controller: FixedGainIntegrator
+    _feedback: NDArray = field(init=False, repr=False)
+    scalar_feedback: ScalarFeedback = field(init=False)
+
+    def __post_init__(self) -> None:
+        dtype = self.controller.dtype
+        # Retain the solver's layout so the covariance contractions keep
+        # their summation order at the selected precision.
+        reconstructor = _quantity(
+            self.reconstructor, u.one, "reconstructor", 2, dtype=dtype, order="A"
+        )
+        sensing_gains = _quantity(
+            self.sensing_gains, u.one, "sensing_gains", 1, dtype=dtype
+        )
+        object.__setattr__(self, "reconstructor", reconstructor)
+        object.__setattr__(self, "sensing_gains", sensing_gains)
+        feedback = tip_tilt_feedback(reconstructor.value, sensing_gains.value)
+        self.controller.transition(feedback)
+        scalar_feedback = _decompose_feedback(feedback)
+        self.controller.transition(scalar_feedback.effective_feedback)
+        immutable = np.frombuffer(feedback.tobytes(), dtype=dtype).reshape(2, 2)
+        object.__setattr__(self, "_feedback", immutable)
+        object.__setattr__(self, "scalar_feedback", scalar_feedback)
+
+    @property
+    def feedback(self) -> NDArray:
+        """Return a read-only view of the actual two-axis feedback matrix."""
+        return self._feedback.view()
+
+    @property
+    def reconstructor_blocks(self) -> NDArray:
+        """Return dimensionless reconstructor blocks of shape (N, 2, 2)."""
+        return _tip_tilt_blocks(self.reconstructor.value)
+
+    def command_noise_covariance(self, measurement_variances: u.Quantity) -> u.Quantity:
+        """Propagate independent white WFS noise through the actual feedback.
+
+        Args:
+            measurement_variances: One nonnegative angular variance per NGS.
+                Both axes of a star have that variance and are independent.
+
+        Returns:
+            Stationary command covariance of shape (2, 2) in mas squared.
+
+        Raises:
+            ValueError: If the variances are invalid or do not align with the NGSs.
+        """
+        variances = _quantity(
+            measurement_variances,
+            u.mas**2,
+            "measurement_variances",
+            1,
+            dtype=self.controller.dtype,
+        ).value
+        noise = reconstructed_noise_covariance(self.reconstructor.value, variances)
+        return self.controller.noise_covariance(self.feedback, noise * u.mas**2)
+
+
+def _tip_tilt_blocks(reconstructor: NDArray) -> NDArray:
+    weights = _real_array(reconstructor, "reconstructor")
+    if (
+        weights.ndim != 2
+        or weights.shape[0] != 2
+        or weights.shape[1] < 2
+        or weights.shape[1] % 2
+    ):
+        raise ValueError("reconstructor must have shape (2, 2*N) with at least one NGS")
+    return weights.reshape(2, -1, 2).transpose(1, 0, 2)
+
+
+def tip_tilt_feedback(reconstructor: NDArray, sensing_gains: NDArray) -> NDArray:
+    """Build the two-axis feedback matrix from the gain-weighted reconstructor.
+
+    Pass numerical dimensionless weights with shape (2, 2*N) and interleaved
+    NGS x/y inputs, and one numerical dimensionless tilt gain per star. Use
+    float32 or float64 arrays. Integer inputs are promoted to float64.
+    Convert quantities to their numerical values before calling. The result
+    uses x/y order on both axes.
+    """
+    blocks = _tip_tilt_blocks(reconstructor)
+    gains = _real_array(sensing_gains, "sensing_gains")
+    if gains.shape != (len(blocks),):
+        raise ValueError("sensing_gains must give one gain per NGS")
+    return np.einsum("g,gab->ab", gains, blocks)
+
+
+def reconstructed_noise_covariance(
+    reconstructor: NDArray, measurement_variances: NDArray
+) -> NDArray:
+    """Project independent per-axis NGS noise into command coordinates.
+
+    Pass numerical dimensionless (2, 2*N) weights with interleaved NGS x/y
+    inputs and one nonnegative numerical variance per star, shared by its
+    two axes. Use float32 or float64 arrays. Integer inputs are promoted to
+    float64. Convert quantities to numerical values in a common angular-squared
+    unit before calling. The result is a (2, 2) covariance in that unit, before
+    temporal filtering.
+    """
+    blocks = _tip_tilt_blocks(reconstructor)
+    variances = _real_array(measurement_variances, "measurement_variances")
+    if variances.shape != (len(blocks),) or np.any(variances < 0):
+        raise ValueError(
+            "measurement_variances must give one nonnegative value per NGS"
+        )
+    return np.einsum("g,gab,gcb->ac", variances, blocks, blocks)
+
+
+def _validate_scalar_decomposition(
+    feedback: NDArray,
+    effective_feedback: NDArray,
+    strengths: NDArray,
+    projectors: NDArray,
+    symmetric_fallback: bool,
+) -> None:
+    """Check the scalar representation shared by runtime prediction and loading.
+
+    The effective matrix must equal the actual feedback, or its symmetric part
+    when the fallback is declared. Projectors must be idempotent, resolve identity
+    and reproduce that matrix with the stored strengths. The idempotence check
+    allows two-term matrix-product roundoff for non-orthogonal projectors.
+    Values are checked, never conditioned.
+    """
+    feedback = _real_array(feedback, "feedback")
+    if feedback.shape != (2, 2):
+        raise ValueError("feedback must be a two-by-two matrix")
+    eps = max(
+        np.finfo(values.dtype).eps
+        for values in (feedback, effective_feedback, strengths, projectors)
+    )
+    tolerance = max(1e-10, 32 * eps)
+    expected = (feedback + feedback.T) / 2 if symmetric_fallback else feedback
+    if not np.allclose(effective_feedback, expected, rtol=tolerance, atol=tolerance):
+        raise ValueError("effective feedback must match the declared feedback response")
+    if not np.allclose(
+        projectors.sum(0), np.eye(2), rtol=tolerance, atol=tolerance
+    ) or not np.allclose(
+        np.einsum("p,pab->ab", strengths, projectors),
+        effective_feedback,
+        rtol=tolerance,
+        atol=tolerance,
+    ):
+        raise ValueError("feedback scalar decomposition failed reconstruction")
+    # Each 2x2 product entry is a two-term dot product, with error bounded
+    # componentwise by gamma_2 * (abs(P) @ abs(P)).
+    projector_eps = np.finfo(projectors.dtype).eps
+    projector_tolerance = max(1e-10, 32 * projector_eps)
+    gamma_2 = 2 * projector_eps / (1 - 2 * projector_eps)
+    with np.errstate(over="ignore", invalid="ignore"):
+        products = projectors @ projectors
+        product_roundoff = gamma_2 * (np.abs(projectors) @ np.abs(projectors))
+        allowed = projector_tolerance * (1 + np.abs(projectors)) + product_roundoff
+    if (
+        not np.isfinite(products).all()
+        or not np.isfinite(allowed).all()
+        or not np.all(np.abs(products - projectors) <= allowed)
+    ):
+        raise ValueError("feedback scalar decomposition requires idempotent projectors")
+    diagonal = np.diagonal(projectors, axis1=-2, axis2=-1)
+    trace_error = np.abs(diagonal.sum(axis=-1) - 1)
+    trace_tolerance = projector_tolerance + 4 * projector_eps * np.sum(
+        np.abs(diagonal), axis=-1
+    )
+    if np.any(trace_error > trace_tolerance):
+        raise ValueError("feedback scalar decomposition requires rank-one projectors")
+
+
+def _decompose_feedback(feedback: NDArray) -> ScalarFeedback:
+    """Resolve real projectors, preserving the accepted complex-B approximation.
+
+    Defective or ill-conditioned eigenbases cannot resolve the two scalar
+    responses. Noise propagation continues to use the actual feedback.
+    """
+    dtype = feedback.dtype
+    eps = np.finfo(dtype).eps
+    values, basis = np.linalg.eig(feedback)
+    fallback = bool(np.max(np.abs(values.imag)) > 1e-10)
+    effective = (feedback + feedback.T) / 2 if fallback else feedback
+    if fallback:
+        values, basis = np.linalg.eigh(effective)
+    else:
+        values, basis = values.real, basis.real
+    condition = float(np.linalg.cond(basis))
+    if condition > min(1e10, 1 / (100 * eps)):
+        if np.allclose(
+            effective,
+            np.eye(2, dtype=dtype) * np.trace(effective) / 2,
+            rtol=max(1e-10, 4 * eps),
+            atol=max(1e-12, eps),
+        ):
+            basis = np.eye(2, dtype=dtype)
+            values = np.repeat(np.trace(effective) / 2, 2)
+            condition = 1.0
+        else:
+            raise ValueError("feedback has an ill-conditioned or defective eigenbasis")
+    inverse = np.linalg.inv(basis)
+    projections = np.stack([np.outer(basis[:, p], inverse[p]) for p in range(2)])
+    scalar_feedback = ScalarFeedback(
+        strengths=values,
+        projectors=projections,
+        effective_feedback=effective,
+        symmetric_fallback=fallback,
+        approximation_relative_error=float(
+            np.linalg.norm(effective - feedback) / max(np.linalg.norm(feedback), 1e-30)
+        ),
+        eigenbasis_condition=condition,
+    )
+    scalar_feedback.validate(feedback)
+    return scalar_feedback
 
 
 def integrator_transition(

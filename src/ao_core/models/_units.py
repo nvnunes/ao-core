@@ -20,7 +20,7 @@ def validate_float_dtype(dtype: DTypeLike) -> np.dtype:
     return dtype
 
 
-def _quantity(value, unit, name, ndim, *, dtype=np.float64):
+def _quantity(value, unit, name, ndim, *, dtype=np.float64, order="C"):
     if not isinstance(value, u.Quantity):
         raise TypeError(f"{name} must be an Astropy Quantity")
     dtype = validate_float_dtype(dtype)
@@ -36,8 +36,11 @@ def _quantity(value, unit, name, ndim, *, dtype=np.float64):
     if any(n == 0 for n in array.shape):
         raise ValueError(f"{name} must not be empty")
     dtype = validate_float_dtype(dtype)
-    array = np.asarray(array, dtype=dtype, order="C")
-    immutable = np.frombuffer(array.tobytes(), dtype=dtype).reshape(array.shape)
+    array = np.asarray(array, dtype=dtype, order=order)
+    order = "F" if np.isfortran(array) else "C"
+    immutable = np.frombuffer(array.tobytes(order=order), dtype=dtype).reshape(
+        array.shape, order=order
+    )
     return u.Quantity(immutable, unit, copy=False)
 
 

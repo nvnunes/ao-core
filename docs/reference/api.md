@@ -63,14 +63,18 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
     options:
       members:
         - FixedGainIntegrator
+        - ScalarFeedback
+        - TipTiltControl
         - filter_input
         - integrator_noise_covariance
         - integrator_noise_lags
         - integrator_transition
         - polc_transfer
+        - reconstructed_noise_covariance
         - scalar_filter
         - settling_cut
         - state_matrix
+        - tip_tilt_feedback
 
 ::: ao_core.models.exposure
     options:
@@ -104,6 +108,9 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
     options:
       members:
         - FieldCovariance
+        - TiltCommandCovariances
+        - TiltResidualCovariances
+        - assemble_tilt_residual_covariances
         - response_covariance
         - source_minus_correction_covariance
 

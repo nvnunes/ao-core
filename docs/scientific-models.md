@@ -35,6 +35,13 @@ reconstruction returns the identity. Multistar reconstruction supports a
 direct solve or an explicit SVD cutoff. These operations default to
 float64 and support explicit float32.
 
+`TipTiltControl` combines the solved reconstructor and NGS sensing gains
+with a `FixedGainIntegrator`. Its scalar feedback describes signal filtering,
+and `command_noise_covariance` propagates noise through the actual feedback.
+`assemble_tilt_residual_covariances` combines the supplied angular command
+and cross-covariance terms with that command noise. Applications evaluate
+those inputs and use the resulting residual covariances.
+
 `prepare_modal_pupil` builds piston-free modes on the sampled aperture.
 `FieldCovariance` uses the supplied atmospheric layers, projected beacon
 height, fitting weights and controller settings. It retains the shared

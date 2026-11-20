@@ -97,12 +97,8 @@ needs additional fields from the same INI. The loader decodes the shared
 ```python
 from dataclasses import dataclass
 
-from ao_core.models.config import (
-    Configuration,
-    IniSource,
-    load_ao_configuration,
-    read_ini_scalar,
-)
+from ao_core.io.ini import IniSource, read_ini_scalar
+from ao_core.models.config import Configuration, load_ao_configuration
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -146,7 +142,8 @@ from the same file. It returns the resolved source path and the
 case-sensitive parser.
 
 ```python
-from ao_core.models.config import Configuration, read_ini
+from ao_core.io.ini import read_ini
+from ao_core.models.config import Configuration
 
 ini_path, ini_parser = read_ini("system.ini")
 system = Configuration.from_ini(ini_parser, ini_path=ini_path)

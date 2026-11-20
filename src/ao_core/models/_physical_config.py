@@ -13,7 +13,7 @@ from astropy import units as u
 from astropy.io import fits
 from scipy.ndimage import rotate, zoom
 
-from ._ini import (
+from ..io.ini import (
     IniSource,
     polar_to_cartesian,
     read_ini_array,

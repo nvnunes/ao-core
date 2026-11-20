@@ -16,6 +16,19 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - clear_observation
         - collect_schema_issues
 
+::: ao_core.io.ini
+    options:
+      members:
+        - IniSource
+        - ini_to_mapping
+        - parse_ini
+        - polar_to_cartesian
+        - read_ini
+        - read_ini_array
+        - read_ini_scalar
+        - read_ini_source
+        - resolve_ini_path
+
 ::: ao_core.photometry
     options:
       members:
@@ -36,22 +49,13 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
         - DeformableMirrorConfig
         - DetectorConfig
         - FittingConfig
-        - IniSource
         - LensletConfig
         - LoopConfig
         - NaturalGuideStar
         - Pupil
         - SourceConfig
         - TelescopeConfig
-        - ini_to_mapping
         - load_ao_configuration
-        - parse_ini
-        - polar_to_cartesian
-        - read_ini
-        - read_ini_array
-        - read_ini_scalar
-        - read_ini_source
-        - resolve_ini_path
 
 ::: ao_core.models.atmosphere
     options:

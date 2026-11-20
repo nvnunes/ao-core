@@ -1,16 +1,5 @@
-"""Physical AO inputs and shared INI readers for model implementations."""
+"""Shared physical inputs and the AO simulation INI schema."""
 
-from ._ini import (
-    IniSource,
-    ini_to_mapping,
-    parse_ini,
-    polar_to_cartesian,
-    read_ini,
-    read_ini_array,
-    read_ini_scalar,
-    read_ini_source,
-    resolve_ini_path,
-)
 from ._physical_config import (
     AtmosphereConfig,
     Configuration,
@@ -32,20 +21,11 @@ __all__ = [
     "DeformableMirrorConfig",
     "DetectorConfig",
     "FittingConfig",
-    "IniSource",
     "LensletConfig",
     "LoopConfig",
     "NaturalGuideStar",
     "Pupil",
     "SourceConfig",
     "TelescopeConfig",
-    "ini_to_mapping",
     "load_ao_configuration",
-    "parse_ini",
-    "polar_to_cartesian",
-    "read_ini",
-    "read_ini_array",
-    "read_ini_scalar",
-    "read_ini_source",
-    "resolve_ini_path",
 ]

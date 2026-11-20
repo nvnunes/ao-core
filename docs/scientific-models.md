@@ -234,7 +234,8 @@ the PSF pixel scale from the wavelength and pupil Fourier grid.
 ```python
 from astropy import units as u
 
-from ao_core.models.config import Configuration, NaturalGuideStar, read_ini
+from ao_core.io.ini import read_ini
+from ao_core.models.config import Configuration, NaturalGuideStar
 from ao_core.models.uncertainty import SamplingUncertaintyModel, UncertaintyRequest
 
 ini_path, ini_parser = read_ini("system.ini")

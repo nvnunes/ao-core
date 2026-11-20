@@ -15,6 +15,8 @@ instrument-specific rounding. See the [photometry guide](photometry.md).
 returns unit-aware measurements. Callers supply the images and choose the
 measurements. See the [PSF measurement guide](stats.md).
 
+`ao_core.io.ini` reads INI files, decodes values and resolves relative paths.
+
 `ao_core.models.config` defines shared physical input records and decodes
 their AO INI fields. The INI and in-memory paths produce the same records.
 Consumers can supply guide stars and update case inputs through

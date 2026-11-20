@@ -8,6 +8,7 @@ import pytest
 from astropy import units as u
 from astropy.io import fits
 
+from ao_core.io.ini import parse_ini, read_ini
 from ao_core.models.config import (
     AtmosphereConfig,
     Configuration,
@@ -20,8 +21,6 @@ from ao_core.models.config import (
     SourceConfig,
     TelescopeConfig,
     load_ao_configuration,
-    parse_ini,
-    read_ini,
 )
 from ao_core.models.uncertainty import SamplingSettings
 

@@ -619,7 +619,8 @@ def test_sampling_configuration_ini_and_memory_predict_identically(
 
     from astropy.io import fits
 
-    from ao_core.models.config import Configuration, Pupil, read_ini
+    from ao_core.io.ini import read_ini
+    from ao_core.models.config import Configuration, Pupil
     from ao_core.models.uncertainty import (
         SamplingSettings,
         SamplingUncertaintyModel,
@@ -788,7 +789,8 @@ science_min_radial_nodes = 96
 def test_sampling_settings_missing_section_and_partial_override():
     from dataclasses import replace
 
-    from ao_core.models.config import Configuration, parse_ini
+    from ao_core.io.ini import parse_ini
+    from ao_core.models.config import Configuration
     from ao_core.models.uncertainty import SamplingSettings
 
     defaults = SamplingSettings()
@@ -806,7 +808,8 @@ def test_sampling_settings_missing_section_and_partial_override():
     "key", ["sensing_period_s", "spectral_interval_s", "science_angular_offset"]
 )
 def test_sampling_ini_rejects_internal_grid_settings(key):
-    from ao_core.models.config import Configuration, parse_ini
+    from ao_core.io.ini import parse_ini
+    from ao_core.models.config import Configuration
 
     with pytest.raises(ValueError, match=key):
         Configuration.from_ini(parse_ini(f"[sampling_uncertainty_model]\n{key} = 1"))

@@ -6,7 +6,7 @@ from configparser import ConfigParser
 import numpy as np
 import pytest
 
-from ao_core.models.config import (
+from ao_core.io.ini import (
     ini_to_mapping,
     parse_ini,
     polar_to_cartesian,

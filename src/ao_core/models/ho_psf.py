@@ -12,6 +12,7 @@ from scipy.ndimage import affine_transform
 
 from ao_core.stats import PsfMetadata
 
+from ..io.ini import IniSource, read_ini_array
 from ._ho_common import (
     correction_components,
     predict_common,
@@ -45,7 +46,7 @@ from ._ho_responses import (
 from ._ho_static import static_diffraction
 from ._physical_config import _read_loop, _read_mirrors
 from ._units import _PhysicalRecord, _quantity
-from .config import Configuration, IniSource, LoopConfig, read_ini_array
+from .config import Configuration, LoopConfig
 
 __all__ = [
     "CommandLayout",

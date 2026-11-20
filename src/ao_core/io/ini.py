@@ -1,4 +1,4 @@
-"""Read INI configuration and decode values with caller-supplied conventions."""
+"""Read INI files and resolve their values and paths."""
 
 import ast
 from collections.abc import Callable, Iterable, Mapping
@@ -166,3 +166,16 @@ def ini_to_mapping[T](
         }
         for section in sections
     }
+
+
+__all__ = [
+    "IniSource",
+    "ini_to_mapping",
+    "parse_ini",
+    "polar_to_cartesian",
+    "read_ini",
+    "read_ini_array",
+    "read_ini_scalar",
+    "read_ini_source",
+    "resolve_ini_path",
+]

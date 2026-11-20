@@ -139,65 +139,22 @@ def _command_tilt(axis, valid, calibration_x, calibration_y, weights, width):
 
 
 @dataclass(frozen=True)
-class MirrorSurface:
-    centres: np.ndarray
-    width: float
-    fit_points: np.ndarray
-    fit: np.ndarray
+class MirrorPhaseFit:
+    """Sample positions and their phase-to-command projection."""
 
-    @classmethod
-    def prepare(cls, cells, lenslet_pitch, mirror, pupil_pitch, pupil, geometry):
-        count, pitch, coupling = mirror
-        pupil_axis = (np.arange(len(pupil)) - len(pupil) / 2) * pupil_pitch
-        if geometry is None:
-            axis = (np.arange(count) - (count - 1) / 2) * pitch
-            y, x = np.meshgrid(axis, axis, indexing="ij")
-            coordinates = np.array([y, x]) / pupil_pitch + len(pupil) / 2
-            valid = (
-                ndimage.map_coordinates(
-                    pupil, coordinates, order=0, mode="grid-constant"
-                )
-                > 0
-            )
-            if not valid.any():
-                raise ValueError(
-                    "The nominal DM has no actuator centres on the illuminated pupil"
-                )
-            sample_x = sample_y = pupil_axis
-            weights = pupil
-            cutoff = 5e-4
-        else:
-            axis = geometry.actuator_axis.value
-            valid = geometry.valid_mask
-            sample_x, sample_y = geometry.pupil_x.value, geometry.pupil_y.value
-            weights = geometry.pupil_mask
-            if weights is None:
-                xy = np.meshgrid(sample_y, sample_x, indexing="ij")
-                weights = ndimage.map_coordinates(
-                    pupil,
-                    np.array(xy) / pupil_pitch + len(pupil) / 2,
-                    order=1,
-                )
-            cutoff = geometry.fit_cutoff
-            pitch = (axis[-1] - axis[0]) / (len(axis) - 1)
-            if not np.allclose(np.diff(axis), pitch, rtol=1e-10, atol=1e-13):
-                raise ValueError(
-                    "The Gaussian mirror requires a uniformly spaced actuator axis"
-                )
-        iy, ix = np.nonzero(valid)
-        centres = np.column_stack((axis[ix], axis[iy]))
-        width = np.sqrt(-np.log(coupling)) / pitch
-        # The fit uses the union of closed 3 × 3 nodes of every valid lenslet.
-        first = cells.min(axis=0) - lenslet_pitch / 2
-        cell_indices = np.rint((cells - first) / lenslet_pitch - 0.5).astype(int)
-        offsets = np.stack(np.meshgrid(np.arange(3), np.arange(3)), axis=-1).reshape(
-            9, 2
-        )
-        nodes = np.unique((2 * cell_indices[:, None] + offsets).reshape(-1, 2), axis=0)
-        fit_points = first + nodes * (lenslet_pitch / 2)
-        fit = pinverse(gaussian_basis(fit_points, centres, width), cutoff)
-        fit = _command_tilt(axis, valid, sample_x, sample_y, weights, width) @ fit
-        return cls(centres, width, fit_points, fit)
+    points: np.ndarray
+    projection: np.ndarray
+
+
+def mirror_phase_fit(cells, lenslet_pitch, centres, width, tilt_projection, cutoff):
+    # The fit uses the union of closed 3 × 3 nodes of every valid lenslet.
+    first = cells.min(axis=0) - lenslet_pitch / 2
+    cell_indices = np.rint((cells - first) / lenslet_pitch - 0.5).astype(int)
+    offsets = np.stack(np.meshgrid(np.arange(3), np.arange(3)), axis=-1).reshape(9, 2)
+    nodes = np.unique((2 * cell_indices[:, None] + offsets).reshape(-1, 2), axis=0)
+    points = first + nodes * (lenslet_pitch / 2)
+    fit = pinverse(gaussian_basis(points, centres, width), cutoff)
+    return MirrorPhaseFit(points, tilt_projection @ fit)
 
 
 class CovarianceQueries:
@@ -273,11 +230,12 @@ def slope_matrix(values, lenslets):
 
 
 def lenslet_covariances(grid, layers, lenslets, inversion_floor, regularization):
+    """Return the common-loop slope covariance and the optional design prior."""
     count = lenslets.count
     span = 2 * count - 1
     channels = 2 * len(lenslets.offsets)
-    prior = np.zeros((channels, channels, span, span))
-    temporal = np.zeros_like(prior)
+    temporal = np.zeros((channels, channels, span, span))
+    prior = None if inversion_floor is None else np.zeros_like(temporal)
     for layer in layers:
         pitch = lenslets.pitch * layer.cone_scale
         for guide, initial in enumerate(layer.footprints):
@@ -285,7 +243,8 @@ def lenslet_covariances(grid, layers, lenslets, inversion_floor, regularization)
                 start = initial - layer.footprints[other] - pitch * (count - 1)
                 for i, j in ((0, 0), (0, 1), (1, 1)):
                     cross = layer.power * layer.gradient[i] * layer.gradient[j].conj()
-                    free = fourier_sum(cross, grid.spacing, start, pitch, span).real
+                    if prior is not None:
+                        free = fourier_sum(cross, grid.spacing, start, pitch, span).real
                     tracked = fourier_sum(
                         cross * abs(layer.temporal) ** 2,
                         grid.spacing,
@@ -297,12 +256,16 @@ def lenslet_covariances(grid, layers, lenslets, inversion_floor, regularization)
                     if i != j and guide != other:
                         pairs.append((2 * guide + j, 2 * other + i))
                     for row, col in pairs:
-                        prior[row, col] += free
                         temporal[row, col] += tracked
+                        if prior is not None:
+                            prior[row, col] += free
                         if row != col:
-                            prior[col, row] += free[::-1, ::-1]
                             temporal[col, row] += tracked[::-1, ::-1]
+                            if prior is not None:
+                                prior[col, row] += free[::-1, ::-1]
 
+    if prior is None:
+        return None, slope_matrix(temporal, lenslets)
     regular = slope_matrix(prior, lenslets)
     regular.flat[:: len(regular) + 1] += regularization * np.diag(regular).mean()
     if inversion_floor:
@@ -355,43 +318,12 @@ def solve_commands(factor, target_covariance):
     return linalg.cho_solve(factor, target_covariance.T, check_finite=False).T
 
 
-def estimate_commands(
-    grid,
-    layers,
-    lenslets,
-    mirror,
-    fit_directions,
-    fit_weights,
-    inversion_floor,
-    regularization,
-):
-    """Fit the phase prior on the physical mirror and solve per-actuator weights."""
-    regular, temporal = lenslet_covariances(
-        grid, layers, lenslets, inversion_floor, regularization
-    )
-    factor = linalg.cho_factor(
-        regular, lower=True, overwrite_a=True, check_finite=False
-    )
-    commands = fit_commands(
-        grid, layers, lenslets, mirror, fit_directions, fit_weights, factor
-    )
-    return commands, temporal, factor
-
-
-def fit_commands(
-    grid, layers, lenslets, mirror, directions, weights, factor, *, dtype=np.float64
-):
-    """Fit the weighted phase across directions using the factored slope prior.
-
-    See Eq. (5) for the underlying covariance regression. The
-    target here is the weighted field phase fitted to actuators. [Correia et al. (2018)](https://arxiv.org/pdf/1806.07938)
-    """
-    queries = CovarianceQueries(
-        mirror.fit_points, lenslets.cells, grid.kernel_side, grid.period
-    )
+def phase_slope_covariance(grid, layers, lenslets, points, directions, weights, dtype):
+    """Return unfiltered phase–slope cross moments for a weighted angular target."""
+    queries = CovarianceQueries(points, lenslets.cells, grid.kernel_side, grid.period)
     count = len(lenslets.cells)
-    cross = np.zeros((len(mirror.fit_points), 2 * len(lenslets.offsets) * count))
-    sample = np.empty((2, len(mirror.fit_points), count), dtype=dtype)
+    cross = np.zeros((len(points), 2 * len(lenslets.offsets) * count))
+    sample = np.empty((2, len(points), count), dtype=dtype)
     for layer in layers:
         field_filter = np.zeros_like(grid.fx, dtype=complex)
         for direction, weight in zip(directions, weights, strict=True):
@@ -406,8 +338,8 @@ def fit_commands(
             queries.evaluate(kernels, -footprint, layer.cone_scale, sample)
             cross[:, 2 * guide * count : 2 * (guide + 1) * count] += sample.transpose(
                 1, 0, 2
-            ).reshape(len(mirror.fit_points), -1)
-    return solve_commands(factor, mirror.fit @ cross)
+            ).reshape(len(points), -1)
+    return cross
 
 
 def _command_kernels(grid, layer, field_filter, dtype):
@@ -428,12 +360,12 @@ class DirectionalCommandFit:
     uses the scratch array and the ground-layer cache during a prediction.
     """
 
-    def __init__(self, grid, layers, lenslets, mirror, factor, dtype):
+    def __init__(self, grid, layers, lenslets, phase_fit, factor, dtype):
         self.layers = layers
-        self.mirror = mirror
+        self.phase_fit = phase_fit
         self.factor = factor
         self.queries = CovarianceQueries(
-            mirror.fit_points, lenslets.cells, grid.kernel_side, grid.period
+            phase_fit.points, lenslets.cells, grid.kernel_side, grid.period
         )
         # The first sparse pass consumes rows in y. Store that orientation
         # once so SciPy can flatten each plane without a copy on every pass.
@@ -446,7 +378,7 @@ class DirectionalCommandFit:
         ]
         self.cells = len(lenslets.cells)
         self.guides = len(lenslets.offsets)
-        self.shape = (len(mirror.fit_points), 2 * self.guides * self.cells)
+        self.shape = (len(phase_fit.points), 2 * self.guides * self.cells)
         bytes_per_guide = 2 * self.shape[0] * self.cells * np.dtype(dtype).itemsize
         self.group_size = min(self.guides, max(1, (32 * 1024**2) // bytes_per_guide))
         self.sample = np.empty(
@@ -481,4 +413,4 @@ class DirectionalCommandFit:
             if layer.height == 0:
                 self.ground_cross[index] = target
                 cross += target
-        return solve_commands(self.factor, self.mirror.fit @ cross)
+        return solve_commands(self.factor, self.phase_fit.projection @ cross)

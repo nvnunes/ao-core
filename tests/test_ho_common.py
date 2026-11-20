@@ -13,7 +13,6 @@ from ao_core.models._ho_atmosphere import (
     refractivity,
     science_azimuths,
 )
-from ao_core.models._ho_covariance import projected_modes
 from ao_core.models._ho_optics import (
     InvalidCovarianceOptics,
     OpticalPupil,
@@ -23,7 +22,6 @@ from ao_core.models._ho_optics import (
     precision_probe_pairs,
 )
 from ao_core.models._ho_reconstruction import (
-    MirrorSurface,
     footprint_shift,
     fourier_sum,
     gaussian_slopes,
@@ -31,7 +29,14 @@ from ao_core.models._ho_reconstruction import (
     solve_commands,
 )
 from ao_core.models._ho_static import OriginalMapOptics
-from ao_core.models.config import SourceConfig
+from ao_core.models.config import (
+    DeformableMirrorConfig,
+    LensletConfig,
+    Pupil,
+    SourceConfig,
+    TelescopeConfig,
+)
+from ao_core.models.ho_psf import GaussianDm, ProjectedPolc, ShackHartmannSensing
 
 
 @pytest.mark.parametrize(("count", "size"), [(12, 3), (11, 3), (19, 4)])
@@ -136,8 +141,11 @@ def test_projected_polc_matches_full_sensor_solve():
     expected = np.linalg.solve(
         np.eye(3) - temporal * mean @ mean.T @ feedback, temporal * measured @ slopes
     )
-    update = projected_modes(
-        temporal, mean.T @ feedback @ mean, mean.T @ slopes, mean.T @ feedback @ slopes
+    update, _ = ProjectedPolc().sensor_mean_response(
+        temporal,
+        reduced_feedback=mean.T @ feedback @ mean,
+        atmospheric_means=mean.T @ slopes,
+        feedback_means=mean.T @ feedback @ slopes,
     )
     np.testing.assert_allclose(temporal * slopes + mean @ update, expected)
 
@@ -346,10 +354,26 @@ def test_science_azimuths_preserve_polar_direction_at_field_centre():
 
 def test_nominal_dm_calibrates_actuators_on_the_illuminated_pupil():
     y, x = np.indices((32, 32)) - 16
-    pupil = ((x * x + y * y) <= 12**2).astype(float)
-    cells = np.array([[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]])
-    mirror = MirrorSurface.prepare(cells, 1.0, (25, 0.5, 0.25), 0.125, pupil, None)
-    assert len(mirror.centres) < 25**2
-    assert np.max(np.linalg.norm(mirror.centres, axis=1)) <= 1.5
-    assert np.isfinite(mirror.fit).all()
-    assert np.max(np.abs(mirror.fit)) < 100
+    pupil = Pupil(amplitude=((x * x + y * y) <= 12**2).astype(float), pitch=0.125 * u.m)
+    sensing = ShackHartmannSensing().prepare(
+        pupil=pupil,
+        telescope=TelescopeConfig(diameter=4 * u.m),
+        guides=SourceConfig(
+            height=0 * u.m, directions=[[0, 0]] * u.arcsec, wavelengths=[589] * u.nm
+        ),
+        lenslets=LensletConfig(pitches=[1] * u.m),
+    )
+    mirror = GaussianDm().prepare(
+        config=DeformableMirrorConfig(
+            actuator_count=25,
+            pitch=0.5 * u.m,
+            influence_coupling=0.25 * u.one,
+            influence_model="gaussian",
+        ),
+        pupil=pupil,
+    )
+    assert len(mirror.actuator_positions) < 25**2
+    assert np.max(np.linalg.norm(mirror.actuator_positions.value, axis=1)) <= 1.5
+    fit = mirror._phase_fit(sensing).projection
+    assert np.isfinite(fit).all()
+    assert np.max(np.abs(fit)) < 100

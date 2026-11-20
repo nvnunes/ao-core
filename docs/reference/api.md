@@ -80,11 +80,28 @@ See the [PSF measurement reference](stats.md) for the `ao_core.stats` API.
 ::: ao_core.models.ho_psf
     options:
       members:
+        - CommandLayout
+        - DelayedResidualControl
+        - DelayedResidualResponse
+        - GaussianDm
+        - HoPsfComponents
         - HoPsfConfiguration
         - HoPsfModel
         - HoPsfPrediction
         - HoPsfRequest
+        - HoPsfStage
+        - LayerSlopeResponse
+        - MatrixReconstructor
         - MirrorGeometry
+        - PhaseFitReconstructor
+        - PreparedDm
+        - PreparedReconstructor
+        - PreparedSensing
+        - ProjectedPolc
+        - Reconstructor
+        - ShackHartmannSensing
+        - SlopeLayout
+        - SlopePrior
         - decode_ho_psf
 
 ::: ao_core.models.exposure

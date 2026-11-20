@@ -12,81 +12,66 @@ from scipy.ndimage import affine_transform
 
 from ao_core.stats import PsfMetadata
 
-from ._ho_common import predict_common
+from ._ho_common import (
+    correction_components,
+    predict_common,
+    prepare_dm,
+    prepare_sensing,
+)
+from ._ho_components import (
+    DelayedResidualControl,
+    DelayedResidualResponse,
+    HoPsfComponents,
+    HoPsfStage,
+    MatrixReconstructor,
+    PhaseFitReconstructor,
+    PreparedReconstructor,
+    ProjectedPolc,
+    Reconstructor,
+    SlopePrior,
+)
 from ._ho_metal import require_mps
 from ._ho_optics import diffraction_image
+from ._ho_responses import (
+    CommandLayout,
+    GaussianDm,
+    LayerSlopeResponse,
+    MirrorGeometry,
+    PreparedDm,
+    PreparedSensing,
+    ShackHartmannSensing,
+    SlopeLayout,
+)
 from ._ho_static import static_diffraction
 from ._physical_config import _read_loop, _read_mirrors
 from ._units import _PhysicalRecord, _quantity
 from .config import Configuration, IniSource, LoopConfig, read_ini_array
 
 __all__ = [
+    "CommandLayout",
+    "DelayedResidualControl",
+    "DelayedResidualResponse",
+    "GaussianDm",
+    "HoPsfComponents",
     "HoPsfConfiguration",
     "HoPsfModel",
     "HoPsfPrediction",
     "HoPsfRequest",
+    "HoPsfStage",
+    "LayerSlopeResponse",
+    "MatrixReconstructor",
     "MirrorGeometry",
+    "PhaseFitReconstructor",
+    "PreparedDm",
+    "PreparedReconstructor",
+    "PreparedSensing",
+    "ProjectedPolc",
+    "Reconstructor",
+    "ShackHartmannSensing",
+    "SlopeLayout",
+    "SlopePrior",
     "decode_ho_psf",
 ]
-
-
-@dataclass(frozen=True, kw_only=True, eq=False)
-class MirrorGeometry(_PhysicalRecord):
-    """Resolved coordinates for a calibrated deformable mirror.
-
-    Attributes:
-        actuator_axis: Shared one-dimensional x/y actuator axis in metres.
-        valid_mask: Boolean actuator mask in [y, x] order.
-        pupil_x: One-dimensional x coordinates for the tilt-fit pupil in metres.
-        pupil_y: One-dimensional y coordinates for the tilt-fit pupil in metres.
-        pupil_mask: Pupil weights for calibrating command tilt on the supplied
-            axes. If omitted, the model samples the configured pupil there.
-        fit_cutoff: Absolute singular-value cutoff for the phase-to-command fit.
-    """
-
-    actuator_axis: u.Quantity
-    valid_mask: np.ndarray
-    pupil_x: u.Quantity
-    pupil_y: u.Quantity
-    pupil_mask: np.ndarray | None = None
-    fit_cutoff: float = 5e-4
-
-    def __post_init__(self) -> None:
-        for name in ("actuator_axis", "pupil_x", "pupil_y"):
-            axis = _quantity(getattr(self, name), u.m, name, 1)
-            if np.any(np.diff(axis.value) <= 0):
-                raise ValueError(f"{name} must increase strictly")
-            object.__setattr__(self, name, axis)
-        mask = np.asarray(self.valid_mask)
-        side = len(self.actuator_axis)
-        if (
-            side < 2
-            or mask.dtype != np.bool_
-            or mask.shape != (side, side)
-            or not mask.any()
-        ):
-            raise ValueError(
-                "valid_mask must mark valid actuators on the square [y, x] grid"
-            )
-        mask = np.frombuffer(mask.tobytes(), dtype=bool).reshape(mask.shape)
-        object.__setattr__(self, "valid_mask", mask)
-        if self.pupil_mask is not None:
-            weights = np.asarray(self.pupil_mask, dtype=np.float64)
-            if (
-                weights.shape != (len(self.pupil_y), len(self.pupil_x))
-                or not np.isfinite(weights).all()
-                or np.any(weights < 0)
-                or not np.any(weights > 0)
-            ):
-                raise ValueError(
-                    "pupil_mask must contain finite nonnegative [y, x] weights with light"
-                )
-            weights = np.frombuffer(weights.tobytes(), dtype=np.float64).reshape(
-                weights.shape
-            )
-            object.__setattr__(self, "pupil_mask", weights)
-        if not np.isfinite(self.fit_cutoff) or self.fit_cutoff < 0:
-            raise ValueError("fit_cutoff must be finite and nonnegative")
 
 
 @dataclass(frozen=True, kw_only=True, eq=False)
@@ -309,10 +294,15 @@ class HoPsfModel:
     def __init__(
         self,
         *,
+        components: HoPsfComponents | None = None,
         backend: Literal["cpu", "mps"] = "cpu",
         precision: Literal["float64", "float32"] | None = None,
     ):
-        """Select the execution backend and numerical precision.
+        """Select scientific components, execution backend and precision.
+
+        With no explicit components, use finite Shack–Hartmann sensing,
+        Gaussian DMs, phase fitting and closed-loop projected POLC. When
+        the configuration includes a science DM, add delayed residual control.
 
         CPU defaults to float64. MPS defaults to and requires float32. Metal
         evaluates the phase–command slope queries and spectral products,
@@ -332,6 +322,8 @@ class HoPsfModel:
         cross moments and renders once in float64 on the CPU. A failed
         float64 check raises an error.
         """
+        if components is not None and not isinstance(components, HoPsfComponents):
+            raise TypeError("components must be HoPsfComponents")
         if backend not in ("cpu", "mps"):
             raise ValueError("HO PSF backend must be 'cpu' or 'mps'")
         if precision is None:
@@ -344,6 +336,7 @@ class HoPsfModel:
             require_mps()
         self._backend = backend
         self._precision = precision
+        self._components = components
 
     @property
     def backend(self) -> Literal["cpu", "mps"]:
@@ -355,14 +348,45 @@ class HoPsfModel:
         """The resolved numerical precision policy."""
         return self._precision
 
+    def command_layout(
+        self, request: HoPsfRequest, *, stage: Literal["common", "science"]
+    ) -> CommandLayout:
+        """Return the ordered axes of a stage's actuator-by-slope matrix.
+
+        Resolve pupil, sensing and mirror geometry without preparing the
+        atmospheric prior or running a prediction. Raises if the requested
+        stage or the required geometry is missing.
+        """
+        if not isinstance(request, HoPsfRequest):
+            raise TypeError("request must be a HoPsfRequest")
+        if stage not in ("common", "science"):
+            raise ValueError("stage must be 'common' or 'science'")
+        config = request.config
+        if config.pupil is None:
+            raise ValueError("HO command layout requires a resolved pupil")
+        if config.telescope is None or config.telescope.diameter is None:
+            raise ValueError("HO command layout requires a telescope diameter")
+        components = correction_components(config, self._components)
+        selected = (
+            components.common_stage if stage == "common" else components.science_stage
+        )
+        if selected is None:
+            raise ValueError("The configuration has no science DM")
+        sensing = prepare_sensing(config, components)
+        dm = prepare_dm(config, selected, int(stage == "science"))
+        return CommandLayout(
+            actuator_positions=dm.actuator_positions, slopes=sensing.layout
+        )
+
     def predict(self, request: HoPsfRequest) -> HoPsfPrediction:
         """Evaluate the field at one wavelength on the configured detector.
 
         The diffraction calculation requires a resolved pupil and telescope
         diameter, science directions and wavelength, and a pixel scale and
         positive even FieldOfView. With atmosphere present, the calculation
-        also requires a common DM, guiding and fitting inputs, and the common
-        high-order loop. The nominal square lenslet grid must span the
+        also requires a common DM, guiding inputs, and the common high-order
+        loop. A fitted common reconstructor requires fitting directions and
+        weights. The nominal square lenslet grid must span the
         telescope diameter. The Fourier period, wavelength divided by pixel
         angle in radians, must span a positive even number of lenslet pitches.
         A map with varying static OPD across the illuminated pupil requires
@@ -427,6 +451,7 @@ class HoPsfModel:
                 wavelength.to_value(u.m),
                 int(image_side),
                 phase,
+                components=self._components,
                 dtype=np.dtype(self.precision),
                 backend=self.backend,
             )

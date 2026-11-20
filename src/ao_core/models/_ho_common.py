@@ -7,14 +7,22 @@ from functools import partial
 
 import numpy as np
 from astropy import units as u
-from scipy import ndimage
 
 from ._ho_atmosphere import (
+    PhaseGrid,
+    PhaseLayer,
     chromatic_power,
     phase_layers,
     refractivity,
     science_azimuths,
-    tangent_directions,
+)
+from ._ho_components import (
+    DelayedResidualControl,
+    PreparedReconstructor,
+    ProjectedPolc,
+    SlopePrior,
+    common_fit_target,
+    default_components,
 )
 from ._ho_covariance import command_moments, science_command
 from ._ho_metal import MpsPupilOptics
@@ -29,176 +37,139 @@ from ._ho_optics import (
     phase_pairs_need_float64,
     precision_probe_pairs,
 )
-from ._ho_reconstruction import (
-    DirectionalCommandFit,
-    MirrorSurface,
-    covariance_kernel,
-    estimate_commands,
-    fit_commands,
-)
+from ._ho_reconstruction import covariance_kernel
+from ._ho_responses import PreparedDm, PreparedSensing, tangent_directions
 from ._ho_static import OriginalMapOptics, original_map_side, resampled_field
 from ._ho_tail import atmospheric_tail, atmospheric_tail_lags
 from ._ho_two_stage import TwoStageCovariance
 
 
 @dataclass(frozen=True)
-class Lenslets:
-    pitch: float
-    count: int
-    cells: np.ndarray
-    indices: np.ndarray
-    offsets: np.ndarray
+class _PreparedCorrection:
+    grid: PhaseGrid
+    layers: list[PhaseLayer]
+    sensing: PreparedSensing
+    common_dm: PreparedDm
+    common_rows: np.ndarray
+    prior: SlopePrior
+    common_control: ProjectedPolc
+    science_dm: PreparedDm | None
+    science_reconstructor: PreparedReconstructor | None
+    gain: float
 
 
-def _lenslets(config, diameter):
-    lenslets = config.high_order_lenslets
-    guides = config.high_order_sources
-    sensors = len(guides.directions)
-    if lenslets is None or lenslets.pitches is None:
-        raise ValueError("HO correction requires lenslet pitches")
-    pitches = lenslets.pitches.to_value(u.m)
-    pitch = pitches[0]
-    if len(pitches) not in (1, sensors) or not np.allclose(pitches, pitch):
-        raise ValueError("HO correction requires equal lenslet pitches for all sensors")
-    count = round(diameter / pitch)
-    if not np.isclose(count * pitch, diameter, rtol=1e-10, atol=0) or (
-        lenslets.counts is not None
-        and (
-            len(lenslets.counts) not in (1, sensors)
-            or any(n != count for n in lenslets.counts)
-        )
-    ):
-        raise ValueError("The nominal lenslet grid must span the telescope diameter")
-    offsets = lenslets.grid_offsets
-    offsets = np.zeros((sensors, 2)) if offsets is None else offsets.to_value(u.m)
-    if len(offsets) != sensors:
-        raise ValueError("HO lenslet offsets must match the guide stars")
-    axis = (np.arange(count) - (count - 1) / 2) * pitch
-    x, y = np.meshgrid(axis, axis, indexing="ij")
-    pupil = config.pupil.amplitude
-    pitch_of_pupil = config.pupil.pitch.to_value(u.m)
-    indices_yx = np.array([y, x]) / pitch_of_pupil + len(pupil) / 2
-    valid = ndimage.map_coordinates(pupil, indices_yx, order=0) > 0.5
-    if not valid.any():
-        raise ValueError("The illuminated pupil contains no valid lenslets")
-    return Lenslets(
-        pitch, count, np.column_stack((x[valid], y[valid])), np.argwhere(valid), offsets
+def prepare_sensing(config, components):
+    return components.sensing.prepare(
+        pupil=config.pupil,
+        telescope=config.telescope,
+        guides=config.high_order_sources,
+        lenslets=config.high_order_lenslets,
     )
 
 
-def prepare_common(config, period, wavelength, fft_side):
-    """Resolve per-layer spectra, the calibrated common DM and its estimator."""
-    if len(config.mirrors) not in (1, 2):
+def prepare_dm(config, stage, index):
+    geometry = config.mirror_geometries[index] if config.mirror_geometries else None
+    return stage.dm.prepare(
+        config=config.mirrors[index], pupil=config.pupil, geometry=geometry
+    )
+
+
+def correction_components(config, components):
+    mirrors = len(config.mirrors)
+    if mirrors not in (1, 2):
         raise NotImplementedError(
             "HO turbulence currently requires one common DM and accepts at most one science DM"
         )
-    guides = config.high_order_sources
-    if guides is None or any(
-        value is None
-        for value in (guides.height, guides.directions, guides.wavelengths)
-    ):
-        raise ValueError(
-            "HO correction requires guide-star height, directions and wavelength"
-        )
-    if len(guides.wavelengths) != 1:
-        raise ValueError("HO correction requires one guide-star wavelength")
-    common_loop = config.high_order_loop
-    if (
-        common_loop is None
-        or common_loop.gain is None
-        or common_loop.frame_rate is None
-        or common_loop.delay_frames is None
-    ):
+    if components is None:
+        return default_components(mirrors == 2)
+    if (components.science_stage is not None) != (mirrors == 2):
+        raise ValueError("The science stage must match the configured science DM")
+    return components
+
+
+def prepare_correction(
+    config,
+    period,
+    wavelength,
+    fft_side,
+    components=None,
+    *,
+    dtype=np.float64,
+    include_inactive_science=False,
+):
+    """Bind the components to a common atmospheric and sensing geometry."""
+    components = correction_components(config, components)
+    common_stage, science_stage = components.common_stage, components.science_stage
+    common_interval = (
+        None
+        if config.high_order_loop is None
+        else config.high_order_loop.frame_interval
+    )
+    if common_interval is None:
         raise ValueError(
             "The common high-order loop requires gain, frame rate and delay"
         )
-    if not 0 <= common_loop.gain.value <= 1 or common_loop.delay_frames % 1:
-        raise ValueError("Projected POLC requires gain in [0, 1] and whole-frame delay")
-    fitting = config.fitting
-    if fitting is None or fitting.directions is None or fitting.weights is None:
-        raise ValueError("HO correction requires mirror fitting directions and weights")
-    weights = fitting.weights.value
-    if np.any(weights < 0) or weights.sum() <= 0:
-        raise ValueError("Mirror fitting weights must be nonnegative with positive sum")
     residual_loop = config.residual_high_order_loop
-    if len(config.mirrors) == 2 and residual_loop is None:
+    if science_stage is not None and residual_loop is None:
         raise ValueError(
             "A science DM requires a residual high-order loop configuration"
         )
+    residual = None
     if residual_loop is not None:
-        if residual_loop.gain is None or residual_loop.gain.value < 0:
-            raise ValueError("The residual high-order loop requires a nonnegative gain")
-        if residual_loop.gain.value > 0:
-            if len(config.mirrors) != 2:
-                raise ValueError(
-                    "An active residual high-order loop requires a science DM"
-                )
-            if (
-                residual_loop.delay_frames is None
-                or residual_loop.delay_frames % 1
-                or (
-                    residual_loop.frame_rate is not None
-                    and residual_loop.frame_rate != common_loop.frame_rate
-                )
-            ):
-                raise ValueError(
-                    "The residual high-order loop requires a whole-frame delay at the common high-order loop frame rate"
-                )
-    diameter = config.telescope.diameter.to_value(u.m)
-    lenslets = _lenslets(config, diameter)
+        control = (
+            DelayedResidualControl() if science_stage is None else science_stage.control
+        )
+        residual = control.response(
+            loop=residual_loop, common_frame_interval=common_interval
+        )
+    gain = 0.0 if residual is None else residual.gain
+    if gain and science_stage is None:
+        raise ValueError("An active residual high-order loop requires a science DM")
+
+    target = common_fit_target(common_stage.reconstructor, config.fitting)
+    sensing = prepare_sensing(config, components)
+
     grid, layers = phase_layers(
         config,
         period,
-        diameter,
-        lenslets.pitch,
-        lenslets.count,
-        lenslets.offsets,
+        config.telescope.diameter.to_value(u.m),
+        sensing,
+        common_stage.control,
+        residual,
         wavelength,
         fft_side,
     )
-    mirror = _mirror_surface(config, lenslets, 0)
-    commands, measurement_covariance, factor = estimate_commands(
+    prior = SlopePrior(
         grid,
         layers,
-        lenslets,
-        mirror,
-        tangent_directions(fitting.directions.to_value(u.rad)),
-        weights / weights.sum(),
+        sensing,
         config.inversion_floor,
         config.estimator_regularization,
+        dtype,
     )
-    return grid, layers, lenslets, mirror, commands, measurement_covariance, factor
-
-
-def _mirror_surface(config, lenslets, index):
-    nominal = config.mirrors[index]
-    if nominal.influence_model != "gaussian" or (
-        nominal.conjugate_height is not None and nominal.conjugate_height.value != 0
-    ):
-        raise NotImplementedError(
-            "HO correction currently requires a ground-conjugate Gaussian mirror"
+    common_dm = prepare_dm(config, common_stage, 0)
+    common = common_stage.reconstructor.prepare(
+        sensing=sensing, dm=common_dm, prior=prior
+    )
+    common_shape = (len(common_dm.actuator_positions), sensing._lenslets.slope_count)
+    common_rows = common._common_matrix(target, common_shape)
+    science_dm = science_reconstructor = None
+    if science_stage is not None and (gain or include_inactive_science):
+        science_dm = prepare_dm(config, science_stage, 1)
+        science_reconstructor = science_stage.reconstructor.prepare(
+            sensing=sensing, dm=science_dm, prior=prior
         )
-    if (
-        nominal.pitch is None
-        or nominal.actuator_count is None
-        or nominal.influence_coupling is None
-    ):
-        raise ValueError(
-            "HO correction requires nominal mirror pitch, count and influence coupling"
-        )
-    if nominal.actuator_count < 2 or not 0 < nominal.influence_coupling.value < 1:
-        raise ValueError(
-            "The Gaussian mirror requires at least two actuators per axis and coupling in (0, 1)"
-        )
-    mirror_pitch = nominal.pitch.to_value(u.m)
-    geometry = config.mirror_geometries[index] if config.mirror_geometries else None
-    return MirrorSurface.prepare(
-        lenslets.cells,
-        lenslets.pitch,
-        (nominal.actuator_count, mirror_pitch, nominal.influence_coupling.value),
-        config.pupil.pitch.to_value(u.m),
-        config.pupil.amplitude,
-        geometry,
+    return _PreparedCorrection(
+        grid,
+        layers,
+        sensing,
+        common_dm,
+        common_rows,
+        prior,
+        common_stage.control,
+        science_dm,
+        science_reconstructor,
+        gain,
     )
 
 
@@ -250,21 +221,23 @@ def _field_batches(directions, batch_size, prepare_science):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def predict_common(config, period, wavelength, image_side, phase, *, dtype, backend):
+def predict_common(
+    config, period, wavelength, image_side, phase, *, components, dtype, backend
+):
     """Evaluate the corrected residual across the science field."""
     # Keep the pupil quadrature fixed for detector crops of the native image.
     original_map = phase is not None and config.static_opd_sampling == "original_map"
     fft_side = (
         NATIVE_OPTICAL_SIDE if original_map else max(NATIVE_OPTICAL_SIDE, image_side)
     )
-    grid, layers, lenslets, mirror, weights, temporal_covariance, factor = (
-        prepare_common(
-            config,
-            period,
-            wavelength,
-            fft_side,
-        )
+    correction = prepare_correction(
+        config, period, wavelength, fft_side, components, dtype=dtype
     )
+    grid, layers = correction.grid, correction.layers
+    lenslets = correction.sensing._lenslets
+    weights = correction.common_rows
+    temporal_covariance = correction.prior._temporal_covariance
+    interaction = correction.common_dm.slope_response(correction.sensing)
     pupil = OpticalPupil(
         config.pupil.amplitude,
         config.pupil.pitch.to_value(u.m) * len(config.pupil.amplitude),
@@ -272,7 +245,7 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype, back
         fft_side,
         config.tilt_removal,
     )
-    basis = pupil.fitted_mirror(mirror)
+    basis = correction.common_dm._projected_phase(pupil)
     tilt_modes = pupil.fit_modes(len(grid.fx))
     auxiliary_modes = pupil.fit_modes(fft_side)
     atmospheric = pupil.stationary_moments(
@@ -299,25 +272,30 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype, back
         )
     elif phase is not None:
         field = resampled_field(pupil, config.pupil.amplitude, phase)
-    residual_loop = config.residual_high_order_loop
-    gain = 0.0 if residual_loop is None else residual_loop.gain.value
+    gain = correction.gain
     joint = None
     if gain:
-        science_dm = _mirror_surface(config, lenslets, 1)
         joint = TwoStageCovariance.prepare(
             grid,
             layers,
             lenslets,
-            mirror,
+            interaction,
             weights,
             temporal_covariance,
             gain,
+            correction.common_control,
         )
-        basis = np.column_stack((basis, pupil.fitted_mirror(science_dm)))
+        basis = np.column_stack((basis, correction.science_dm._projected_phase(pupil)))
         command_means = joint.common_means
     else:
         covariance, modes, command_means = command_moments(
-            grid, layers, lenslets, mirror, weights, temporal_covariance
+            grid,
+            layers,
+            lenslets,
+            interaction,
+            weights,
+            temporal_covariance,
+            correction.common_control,
         )
     working_basis = basis.astype(dtype, copy=False)
     probe_pairs = precision_probe_pairs(pupil) if dtype == np.float32 else None
@@ -402,9 +380,9 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype, back
         probe_cross_pairs = probe_cross_pairs.reshape(probe_pairs.shape)
         probe_rows = metal.x.new_tensor(probe_rows)
 
-    directions = config.science_sources.directions.to_value(u.rad)
+    sky_directions = config.science_sources.directions.to(u.rad)
     azimuths = science_azimuths(config.science_sources)
-    directions = tangent_directions(directions)
+    directions = tangent_directions(sky_directions.value)
     zenith, refractivity_difference, fractional_difference = chromatic_geometry(
         config, wavelength
     )
@@ -413,13 +391,19 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype, back
     batch_size = max(1, (256 * 1024**2) // (8 * len(basis) * len(weights)))
     if metal_queries is not None:
         batch_size = min(batch_size, metal_queries.direction_batch_size)
-    prepare_science = None
-    if gain and metal is not None and len(directions):
-        preparation = DirectionalCommandFit(
-            grid, layers, lenslets, science_dm, factor, dtype
+    science_matrices = None
+    if gain:
+        science_shape = (
+            len(correction.science_dm.actuator_positions),
+            lenslets.slope_count,
         )
-        prepare_science = preparation.fit_batch
-    with _field_batches(directions, batch_size, prepare_science) as batches:
+        science_matrices = partial(
+            correction.science_reconstructor._directional_matrices,
+            shape=science_shape,
+            backend=backend,
+        )
+    fit_ahead = science_matrices if metal is not None else None
+    with _field_batches(sky_directions, batch_size, fit_ahead) as batches:
         for batch, take_science_weights in batches:
             batch_directions = directions[batch]
             if take_science_weights is not None:
@@ -430,19 +414,7 @@ def predict_common(config, period, wavelength, image_side, phase, *, dtype, back
             else:
                 science_weights = None
                 if gain:
-                    science_weights = [
-                        fit_commands(
-                            grid,
-                            layers,
-                            lenslets,
-                            science_dm,
-                            direction[None],
-                            (1.0,),
-                            factor,
-                            dtype=dtype,
-                        )
-                        for direction in batch_directions
-                    ]
+                    science_weights = science_matrices(sky_directions[batch])
                 cross = phase_command_cross(batch_directions, science_weights, dtype)
             if gain:
                 covariances = [

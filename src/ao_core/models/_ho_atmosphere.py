@@ -5,13 +5,12 @@ from dataclasses import dataclass
 import numpy as np
 from astropy import units as u
 
-from ._ho_reconstruction import footprint_shift, lenslet_gradient, piston_filter
+from ._ho_reconstruction import piston_filter
 from .atmosphere import (
     _project_zenith_atmosphere,
     frozen_flow_frequency,
     von_karman_spectrum,
 )
-from .control import polc_transfer
 
 
 @dataclass(frozen=True)
@@ -43,14 +42,6 @@ class PhaseLayer:
     residual_shift: np.ndarray | None = None
 
 
-def tangent_directions(directions):
-    """Convert two-dimensional sky offsets in radians to horizontal ray slopes."""
-    offset = np.linalg.norm(directions, axis=-1, keepdims=True)
-    factor = np.ones_like(offset)
-    np.divide(np.tan(offset), offset, out=factor, where=offset != 0)
-    return directions * factor
-
-
 def science_azimuths(sources):
     """Return azimuths in radians, retaining any supplied on-axis direction."""
     directions = sources.directions.to_value(u.rad)
@@ -63,17 +54,23 @@ def science_azimuths(sources):
 
 
 def phase_layers(
-    config, period, diameter, pitch, lenslet_count, offsets, wavelength, optical_side
+    config,
+    period,
+    diameter,
+    sensing,
+    common_control,
+    residual,
+    wavelength,
+    optical_side,
 ):
     """Build projected atmospheric layers and their sensing responses.
 
     See Eqs. (1)–(8) for finite-source footprint contraction and
     translation. [Plantet et al. (2022)](https://arxiv.org/pdf/2209.00931)
     """
-    atmosphere, airmass = _project_zenith_atmosphere(
+    atmosphere, _ = _project_zenith_atmosphere(
         config.atmosphere, config.telescope.zenith_angle
     )
-    guides = config.high_order_sources
     if any(
         getattr(atmosphere, name) is None
         for name in (
@@ -86,12 +83,7 @@ def phase_layers(
         raise ValueError(
             "HO atmosphere requires an outer scale, layer weights and wind vectors"
         )
-    heights = atmosphere.layer_heights.to_value(u.m)
-    beacon = guides.height.to_value(u.m) * airmass
-    if 0 < beacon <= heights.max():
-        raise ValueError("HO guide beacons must be above all turbulent layers")
-    contraction = np.ones_like(heights) if beacon == 0 else 1 - heights / beacon
-    guide_rays = tangent_directions(guides.directions.to_value(u.rad))
+    pitch = sensing._lenslets.pitch
     layer_weights = atmosphere.layer_weights.value
     if layer_weights.sum() <= 0:
         raise ValueError("HO atmospheric layer weights must sum to positive power")
@@ -111,49 +103,53 @@ def phase_layers(
     power = von_karman_spectrum(fx, fy, fried, outer_scale) / period**2
     power[0] = power[:, 0] = 0
     power[count // 2, count // 2] = 0
-    common_loop = config.high_order_loop
-    gain = common_loop.gain.value
-    interval = common_loop.frame_interval.to_value(u.s)
-    delay = int(common_loop.delay_frames)
     layers = []
-    residual_loop = config.residual_high_order_loop
-    for height, scale, weight, speed, angle in zip(
-        heights,
-        contraction,
+    fx_quantity = u.Quantity(fx, 1 / u.m, copy=False)
+    fy_quantity = u.Quantity(fy, 1 / u.m, copy=False)
+    for height, weight, speed, angle in zip(
+        atmosphere.layer_heights,
         layer_weights,
         atmosphere.wind_speeds.to_value(u.m / u.s),
         atmosphere.wind_directions.to_value(u.rad),
         strict=True,
     ):
         frequency = frozen_flow_frequency(fx, fy, speed, angle)
-        temporal = (
-            polc_transfer(frequency, gain, interval, delay)
-            if gain
-            else np.zeros_like(fx)
+        temporal = common_control.transfer(
+            u.Quantity(frequency, u.Hz, copy=False), loop=config.high_order_loop
         )
         residual_shift = None
-        if residual_loop is not None and residual_loop.gain.value:
+        if residual is not None and residual.gain:
             residual_shift = (
                 speed
-                * interval
-                * residual_loop.delay_frames
+                * residual.delay.to_value(u.s)
                 * np.array([np.cos(angle), np.sin(angle)])
             )
+        slopes = sensing.layer_response(
+            layer_height=height, fx=fx_quantity, fy=fy_quantity
+        )
         layers.append(
             PhaseLayer(
-                height,
-                scale,
+                height.to_value(u.m),
+                slopes.cone_scale,
                 weight,
                 weight * power,
-                lenslet_gradient(fx, fy, pitch, scale),
+                slopes.gradient,
                 temporal,
-                footprint_shift(height, scale, guide_rays, offsets),
+                slopes.footprints.to_value(u.m),
                 residual_shift,
             )
         )
     kernel_side = 1 << (max(count, 4 * optical_side) - 1).bit_length()
     return PhaseGrid(
-        period, diameter, lenslet_count, fried, outer_scale, base, fx, fy, kernel_side
+        period,
+        diameter,
+        sensing._lenslets.count,
+        fried,
+        outer_scale,
+        base,
+        fx,
+        fy,
+        kernel_side,
     ), layers
 
 

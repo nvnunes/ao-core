@@ -6,10 +6,10 @@ import numpy as np
 from astropy import units as u
 from scipy import fft
 
-from ._ho_atmosphere import chromatic_power, science_azimuths, tangent_directions
-from ._ho_common import _mirror_surface, chromatic_geometry, prepare_common
+from ._ho_atmosphere import chromatic_power, science_azimuths
+from ._ho_common import chromatic_geometry, prepare_correction
 from ._ho_optics import NATIVE_OPTICAL_SIDE, OpticalPupil
-from ._ho_reconstruction import fit_commands
+from ._ho_responses import tangent_directions
 from ._ho_tail import atmospheric_tail
 from ._ho_two_stage import TwoStageCovariance
 
@@ -25,11 +25,15 @@ def input_band_budget(config):
     angular_step = (config.science_detector.pixel_scale * u.pix).to_value(u.rad)
     period = wavelength / angular_step
     side = NATIVE_OPTICAL_SIDE
-    grid, layers, lenslets, common, common_rows, temporal, factor = prepare_common(
-        config, period, wavelength, side
+    correction = prepare_correction(
+        config, period, wavelength, side, include_inactive_science=True
     )
-    gain = config.residual_high_order_loop.gain.value
-    science_dm = _mirror_surface(config, lenslets, 1)
+    grid, layers = correction.grid, correction.layers
+    lenslets = correction.sensing._lenslets
+    common_rows = correction.common_rows
+    temporal = correction.prior._temporal_covariance
+    gain = correction.gain
+    interaction = correction.common_dm.slope_response(correction.sensing)
     amplitude = config.pupil.amplitude
     pupil = OpticalPupil(
         amplitude,
@@ -38,8 +42,10 @@ def input_band_budget(config):
         side,
         config.tilt_removal,
     )
-    common_basis = pupil.fitted_mirror(common)
-    joint_basis = np.column_stack((common_basis, pupil.fitted_mirror(science_dm)))
+    common_basis = correction.common_dm._projected_phase(pupil)
+    joint_basis = np.column_stack(
+        (common_basis, correction.science_dm._projected_phase(pupil))
+    )
     weights = pupil.amplitude**2 / pupil.pupil_power
     weight_grid = np.zeros((side, side))
     weight_grid[pupil.x_index, pupil.y_index] = weights
@@ -71,24 +77,24 @@ def input_band_budget(config):
         pupil.stationary_moments(sum(layer.power for layer in low_layers), tilt)
     )
     zenith, difference, fraction = chromatic_geometry(config, wavelength)
-    raw_directions = config.science_sources.directions.to_value(u.rad)
-    directions = tangent_directions(raw_directions)
-    field_rows = [
-        fit_commands(
-            grid, layers, lenslets, science_dm, direction[None], (1.0,), factor
-        )
-        for direction in directions
-    ]
+    sky_directions = config.science_sources.directions.to(u.rad)
+    directions = tangent_directions(sky_directions.value)
+    field_rows = correction.science_reconstructor._directional_matrices(
+        sky_directions,
+        (len(correction.science_dm.actuator_positions), lenslets.slope_count),
+        backend="cpu",
+    )
 
     def stage_moments(forward_layers, temporal_covariance):
         joint = TwoStageCovariance.prepare(
             grid,
             forward_layers,
             lenslets,
-            common,
+            interaction,
             common_rows,
             temporal_covariance,
             gain,
+            correction.common_control,
         )
         result = []
         # Evaluate one field at a time to bound the phase/command work arrays.

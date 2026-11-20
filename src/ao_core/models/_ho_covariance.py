@@ -11,7 +11,6 @@ from ._ho_reconstruction import (
     CovarianceQueries,
     covariance_kernel,
     fourier_sum,
-    gaussian_slopes,
 )
 
 
@@ -40,29 +39,6 @@ def _slope_response(rows, grid, layer, lenslets):
     return result
 
 
-def projected_modes(temporal, feedback, sensor_means, feedback_means):
-    """Small exact POLC solve for the removed measurement means."""
-    return _solve_projected_modes(
-        temporal, feedback, -sensor_means + temporal * feedback_means
-    )
-
-
-def _solve_projected_modes(temporal, feedback, rhs):
-    count = len(feedback)
-    flat = temporal.ravel()
-    shape = rhs.shape
-    rhs = rhs.reshape(count, -1)
-    output = np.empty_like(rhs)
-    for first in range(0, len(flat), 4096):
-        block = slice(first, first + 4096)
-        control = flat[block, None, None]
-        matrix = np.eye(count) - control * feedback
-        output[:, block] = (
-            np.linalg.solve(matrix, rhs[:, block].T[..., None]) * control
-        )[..., 0].T
-    return output.reshape(shape)
-
-
 def add_slope_mean_cross(result, grid, layer, lenslets, weighted):
     """Accumulate slope/mean-transfer covariance in the valid-cell order."""
     samples = len(lenslets.cells)
@@ -78,16 +54,15 @@ def add_slope_mean_cross(result, grid, layer, lenslets, weighted):
             result[first : first + samples] += values[:, x, y].T
 
 
-def command_moments(grid, layers, lenslets, mirror, weights, measurement_covariance):
+def command_moments(
+    grid, layers, lenslets, interaction, weights, measurement_covariance, control
+):
     """Return applied covariance, mean-transfer modes and their command map."""
     samples = len(lenslets.cells)
     channels = 2 * len(lenslets.offsets)
     means = np.kron(np.eye(channels), np.ones((samples, 1)) / np.sqrt(samples))
-    sensor_mirror = gaussian_slopes(
-        lenslets.cells, mirror.centres, mirror.width, lenslets.pitch, lenslets.offsets
-    )
     # Form only the rows of H = sensor_mirror @ weights needed by the mean solve.
-    mean_feedback = (means.T @ sensor_mirror) @ weights
+    mean_feedback = (means.T @ interaction) @ weights
     command_means = weights @ means
     feedback = mean_feedback @ means
     rows = np.concatenate((means.T, mean_feedback))
@@ -97,9 +72,12 @@ def command_moments(grid, layers, lenslets, mirror, weights, measurement_covaria
     modes = []
     for layer in layers:
         unprojected = _slope_response(rows, grid, layer, lenslets)
-        mean_modes = projected_modes(
-            layer.temporal, feedback, unprojected[:channels], unprojected[channels:]
-        )
+        mean_modes = control.sensor_mean_response(
+            layer.temporal,
+            reduced_feedback=feedback,
+            atmospheric_means=unprojected[:channels],
+            feedback_means=unprojected[channels:],
+        )[0]
         modes.append(mean_modes)
         flat = mean_modes.reshape(channels, -1)
         covariance += ((flat * layer.power.ravel()) @ flat.conj().T).real

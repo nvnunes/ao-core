@@ -7,10 +7,9 @@ import numpy as np
 from ._ho_covariance import (
     ScienceCommandQueries,
     _slope_response,
-    _solve_projected_modes,
     add_slope_mean_cross,
 )
-from ._ho_reconstruction import fourier_sum, gaussian_slopes, slope_matrix
+from ._ho_reconstruction import fourier_sum, slope_matrix
 
 
 def _delay_transfer(grid, layer, gain):
@@ -97,18 +96,11 @@ class TwoStageCovariance:
     mean_modes: tuple[tuple[np.ndarray, np.ndarray, np.ndarray], ...]
 
     @classmethod
-    def prepare(cls, grid, layers, lenslets, mirror, rows, primary, gain):
+    def prepare(cls, grid, layers, lenslets, interaction, rows, primary, gain, control):
         count = 2 * len(lenslets.offsets)
         samples = len(lenslets.cells)
         means = np.kron(np.eye(count), np.ones((samples, 1)) / np.sqrt(samples))
-        slopes = gaussian_slopes(
-            lenslets.cells,
-            mirror.centres,
-            mirror.width,
-            lenslets.pitch,
-            lenslets.offsets,
-        )
-        feedback = slopes @ rows
+        feedback = interaction @ rows
         mean_feedback = means.T @ feedback
         reduced_feedback = mean_feedback @ means
         common_map = np.concatenate((means, np.zeros((len(means), 2 * count))), axis=1)
@@ -129,9 +121,14 @@ class TwoStageCovariance:
             primary_transfer = layer.temporal
             measured = _slope_response(sensor_rows, grid, layer, lenslets)
             # The three mean blocks couple the primary and delayed residual streams.
-            rhs = -measured[:count] + primary_transfer * measured[count:]
-            projected = _solve_projected_modes(primary_transfer, reduced_feedback, rhs)
-            delayed_rhs = delay * rhs
+            projected, driving_term = control.sensor_mean_response(
+                primary_transfer,
+                reduced_feedback=reduced_feedback,
+                atmospheric_means=measured[:count],
+                feedback_means=measured[count:],
+            )
+            delayed_rhs = delay * driving_term
+            del driving_term
             modes = np.concatenate((projected, delayed_rhs, delay * projected))
             # Combining the last block on demand avoids retaining the same modes twice.
             layer_modes.append((projected, delayed_rhs, delay))

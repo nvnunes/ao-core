@@ -5,7 +5,14 @@ import numpy as np
 import pytest
 from astropy import units as u
 
-from ao_core.models import _ho_common, _ho_metal, _ho_metal_queries, _ho_optics, ho_psf
+from ao_core.models import (
+    _ho_atmosphere,
+    _ho_common,
+    _ho_metal,
+    _ho_metal_queries,
+    _ho_optics,
+    ho_psf,
+)
 from ao_core.models.config import (
     AtmosphereConfig,
     DeformableMirrorConfig,
@@ -19,9 +26,18 @@ from ao_core.models.config import (
     load_ao_configuration,
 )
 from ao_core.models.ho_psf import (
+    DelayedResidualControl,
+    GaussianDm,
+    HoPsfComponents,
     HoPsfConfiguration,
     HoPsfModel,
     HoPsfRequest,
+    HoPsfStage,
+    MatrixReconstructor,
+    PhaseFitReconstructor,
+    PreparedReconstructor,
+    ProjectedPolc,
+    ShackHartmannSensing,
     decode_ho_psf,
 )
 
@@ -239,6 +255,305 @@ def mps_device():
         torch.mps, "compile_shader"
     ):
         pytest.skip("Metal shader execution is unavailable")
+
+
+@pytest.fixture
+def ho_components():
+    return HoPsfComponents(
+        sensing=ShackHartmannSensing(),
+        common_stage=HoPsfStage(
+            dm=GaussianDm(),
+            reconstructor=PhaseFitReconstructor(),
+            control=ProjectedPolc(),
+        ),
+        science_stage=HoPsfStage(
+            dm=GaussianDm(),
+            reconstructor=PhaseFitReconstructor(),
+            control=DelayedResidualControl(),
+        ),
+    )
+
+
+@pytest.mark.parametrize("backend", ["cpu", "mps"])
+@pytest.mark.parametrize("two_stage", [False, True])
+def test_explicit_ho_components_match_defaults(
+    corrected_config, ho_components, request, backend, two_stage
+):
+    if backend == "mps":
+        request.getfixturevalue("mps_device")
+    config = corrected_config
+    if not two_stage:
+        config = replace(
+            config, mirrors=config.mirrors[:1], residual_high_order_loop=None
+        )
+        ho_components = replace(ho_components, science_stage=None)
+    prediction_request = HoPsfRequest(config=config)
+    default = HoPsfModel(backend=backend).predict(prediction_request)
+    explicit = HoPsfModel(components=ho_components, backend=backend).predict(
+        prediction_request
+    )
+    np.testing.assert_array_equal(explicit.positions, default.positions)
+    assert explicit.full_flux == default.full_flux
+    scaled_error = (
+        abs(explicit.psfs - default.psfs).sum(axis=(1, 2)) / default.full_flux
+    )
+    # Metal combines pupil pairs with parallel atomic additions.
+    assert np.max(scaled_error) <= (2e-7 if backend == "mps" else 0)
+
+
+@pytest.mark.parametrize("weights", [None, [-1.0]])
+def test_invalid_common_fit_target_is_rejected_before_phase(
+    corrected_config, monkeypatch, weights
+):
+    def phase_layers(*args):
+        pytest.fail("Built atmospheric spectra before validating the fit target")
+
+    monkeypatch.setattr(_ho_common, "phase_layers", phase_layers)
+    fitting = (
+        None
+        if weights is None
+        else replace(corrected_config.fitting, weights=weights * u.one)
+    )
+    prediction_request = HoPsfRequest(config=replace(corrected_config, fitting=fitting))
+    with pytest.raises(ValueError, match="[Mm]irror fitting"):
+        HoPsfModel().predict(prediction_request)
+
+
+def test_supplied_slope_matrix_layout_and_ownership(corrected_config, ho_components):
+    model = HoPsfModel(components=ho_components)
+    request = HoPsfRequest(config=corrected_config)
+    layout = model.command_layout(request, stage="common")
+    assert layout.slopes.size == 2 * len(layout.slopes.lenslet_positions)
+    with pytest.raises(ValueError, match="actuator-by-slope shape"):
+        MatrixReconstructor(matrix=np.zeros(layout.shape[::-1]), layout=layout)
+    with pytest.raises(TypeError, match="numerical array with values in metres"):
+        MatrixReconstructor(matrix=np.full(layout.shape, 250.0) * u.mm, layout=layout)
+    values = np.ones(layout.shape)
+    reconstructor = MatrixReconstructor(matrix=values, layout=layout)
+    values[0] = 0
+    supplied = reconstructor.matrix(corrected_config.fitting.directions)
+    assert np.all(supplied == 1)
+    assert not supplied.flags.writeable
+
+    reversed_layout = replace(
+        layout, actuator_positions=layout.actuator_positions[::-1]
+    )
+    calibrated = replace(
+        ho_components,
+        common_stage=replace(
+            ho_components.common_stage,
+            reconstructor=MatrixReconstructor(matrix=values, layout=reversed_layout),
+        ),
+    )
+    with pytest.raises(ValueError, match="actuator and slope order"):
+        HoPsfModel(components=calibrated).predict(request)
+
+
+@pytest.mark.parametrize("backend", ["cpu", "mps"])
+def test_reconstructor_can_reuse_matrix_storage(
+    corrected_config, ho_components, request, backend
+):
+    if backend == "mps":
+        request.getfixturevalue("mps_device")
+    prediction_request = HoPsfRequest(config=corrected_config)
+    layout = HoPsfModel().command_layout(prediction_request, stage="common")
+    rng = np.random.default_rng(94)
+    common_rows = rng.normal(scale=0.04, size=layout.shape)
+    science_rows = rng.normal(scale=0.04, size=layout.shape)
+
+    class ReusedMatrix(PreparedReconstructor):
+        def __init__(self, rows, storage, reuse):
+            self.rows = rows
+            self.storage = storage
+            self.reuse = reuse
+
+        def prepare(self, *, sensing, dm, prior):
+            return self
+
+        def matrix(self, directions, *, weights=None):
+            scale = 1 + 0.04 * directions.to_value(u.arcsec)[0, 0]
+            np.multiply(self.rows, scale, out=self.storage)
+            return self.storage if self.reuse else self.storage.copy()
+
+    def predict(reuse):
+        storage = np.empty(layout.shape)
+        components = replace(
+            ho_components,
+            common_stage=replace(
+                ho_components.common_stage,
+                reconstructor=ReusedMatrix(common_rows, storage, reuse),
+            ),
+            science_stage=replace(
+                ho_components.science_stage,
+                reconstructor=ReusedMatrix(science_rows, storage, reuse),
+            ),
+        )
+        return HoPsfModel(components=components, backend=backend).predict(
+            prediction_request
+        )
+
+    reference = predict(False)
+    reused = predict(True)
+    error = abs(reused.psfs - reference.psfs).sum(axis=(1, 2)) / reference.full_flux
+    assert np.max(error) <= (2e-7 if backend == "mps" else 0)
+
+
+def test_supplied_common_matrix_matches_direct_covariance_and_psf(
+    corrected_config, ho_components, monkeypatch, record_property
+):
+    config = replace(
+        corrected_config,
+        fitting=None,
+        tilt_removal="none",
+        detector_origin="geometric",
+        telescope=replace(corrected_config.telescope, zenith_angle=0 * u.deg),
+        science_sources=replace(
+            corrected_config.science_sources, directions=[[0, 0]] * u.arcsec
+        ),
+        high_order_sources=replace(
+            corrected_config.high_order_sources,
+            height=0 * u.m,
+            wavelengths=corrected_config.science_sources.wavelengths,
+        ),
+        atmosphere=replace(
+            corrected_config.atmosphere,
+            layer_heights=[0] * u.m,
+            wind_speeds=[12.5] * u.m / u.s,
+            wind_directions=[0] * u.deg,
+        ),
+        residual_high_order_loop=LoopConfig(gain=0.8 * u.one, delay_frames=5),
+    )
+    period = 16.0
+    bins = np.array([[1, 2], [2, -1], [4, 0], [-1, -2], [-2, 1], [-4, 0]])
+    power = np.array([0.08, 0.12, 0.06] * 2)
+
+    def spectrum(fx, fy, fried, outer_scale):
+        result = np.zeros_like(fx)
+        origin = len(fx) // 2
+        result[tuple((bins + origin).T)] = power * period**2
+        return result
+
+    def no_tail(grid, pupil):
+        return (
+            np.zeros((pupil.side, pupil.side)),
+            np.zeros_like(pupil.ramps),
+            np.empty((0, 0)),
+        )
+
+    monkeypatch.setattr(_ho_atmosphere, "von_karman_spectrum", spectrum)
+    monkeypatch.setattr(_ho_common, "atmospheric_tail", no_tail)
+
+    captured = {}
+    render = _ho_common.coherence_image
+
+    def capture(pupil, residual, *args, **kwargs):
+        captured["residual"] = residual
+        captured["pupil"] = pupil
+        return render(pupil, residual, *args, **kwargs)
+
+    class CaptureScienceFit(PhaseFitReconstructor):
+        def prepare(self, *, sensing, dm, prior):
+            fit = super().prepare(sensing=sensing, dm=dm, prior=prior)
+            captured["science_rows"] = fit.matrix(config.science_sources.directions)
+            captured["science_dm"] = dm
+            return fit
+
+    monkeypatch.setattr(_ho_common, "coherence_image", capture)
+    prediction_request = HoPsfRequest(config=config)
+    layout = HoPsfModel().command_layout(prediction_request, stage="common")
+    positions = layout.actuator_positions.to_value(u.m)
+    rounded_positions = np.nextafter(positions, 0.0) * u.m
+    calibration_layout = replace(layout, actuator_positions=rounded_positions)
+    rows = np.random.default_rng(151).normal(scale=0.05, size=layout.shape)
+    components = replace(
+        ho_components,
+        common_stage=replace(
+            ho_components.common_stage,
+            reconstructor=MatrixReconstructor(matrix=rows, layout=calibration_layout),
+        ),
+        science_stage=replace(
+            ho_components.science_stage, reconstructor=CaptureScienceFit()
+        ),
+    )
+    prediction = HoPsfModel(components=components).predict(prediction_request)
+    science_rows = captured["science_rows"]
+    pupil = captured["pupil"]
+
+    # Directly solve the two slope streams on each retained Fourier mode.
+    frequencies = bins / period
+    cells = layout.slopes.lenslet_positions.to_value(u.m)
+    wave = np.exp(2j * np.pi * (cells @ frequencies.T))
+    gradients = 2j * np.pi * frequencies.T * np.prod(np.sinc(frequencies), axis=1)
+    raw = np.concatenate([wave * gradient for gradient in gradients])
+    mean = np.kron(np.eye(2), np.full((len(cells), len(cells)), 1 / len(cells)))
+    identity = np.eye(len(raw))
+    common_dm = components.common_stage.dm.prepare(
+        config=config.mirrors[0], pupil=config.pupil
+    )
+    sensing = components.sensing.prepare(
+        pupil=config.pupil,
+        telescope=config.telescope,
+        guides=config.high_order_sources,
+        lenslets=config.high_order_lenslets,
+    )
+    feedback = common_dm.slope_response(sensing) @ rows
+    seconds_per_frame = 1 / 500
+    frame_phase = np.exp(2j * np.pi * frequencies[:, 0] * 12.5 * seconds_per_frame)
+    common_transfer = 0.3 * frame_phase**2 / (1 - 0.7 * frame_phase)
+    common_slopes = np.column_stack(
+        [
+            np.linalg.solve(
+                identity - transfer * mean @ feedback,
+                transfer * (identity - mean) @ mode,
+            )
+            for transfer, mode in zip(common_transfer, raw.T, strict=True)
+        ]
+    )
+    science_transfer = 0.8 * frame_phase**5
+    science_slopes = science_transfer * (
+        (identity - mean) @ (raw - feedback @ common_slopes)
+    )
+    assert (
+        np.linalg.norm(science_slopes - science_transfer * ((identity - mean) @ raw))
+        > 0.01
+    )
+
+    def dm_basis(dm):
+        centres = dm.actuator_positions.to_value(u.m)
+        separation = pupil.points[:, None, :] - centres
+        return 0.25 ** np.sum(separation**2, axis=2)
+
+    residual_modes = (
+        np.exp(2j * np.pi * (pupil.points @ frequencies.T))
+        - dm_basis(common_dm) @ rows @ common_slopes
+        - dm_basis(captured["science_dm"]) @ science_rows @ science_slopes
+    )
+    covariance = ((residual_modes * power) @ residual_modes.conj().T).real
+    residual = captured["residual"]
+    covariance_error = 0.0
+    for first, block in residual.blocks(rows=8):
+        expected = covariance[first : first + len(block), first:]
+        covariance_error = max(covariance_error, np.max(abs(block - expected)))
+    assert covariance_error < 2e-12
+
+    # Transform the pair-weighted coherence directly at the geometric pixel centres.
+    variance = np.diag(covariance)
+    coherence = np.exp(covariance - 0.5 * (variance[:, None] + variance))
+    coherence *= np.outer(pupil.amplitude, pupil.amplitude)
+    pixels = np.arange(16) - 7.5
+    x, y = np.meshgrid(pixels, pixels, indexing="xy")
+    detector_angles = np.column_stack((x.ravel(), y.ravel())) / period
+    detector_wave = np.exp(-2j * np.pi * (detector_angles @ pupil.points.T))
+    expected_image = np.sum(
+        (detector_wave @ coherence) * detector_wave.conj(), axis=1
+    ).real
+    expected_image = expected_image.reshape(16, 16)
+    image_error = (
+        np.abs(prediction.psfs[0] - expected_image).sum() / prediction.full_flux
+    )
+    record_property("max_abs_covariance_error_rad2", float(covariance_error))
+    record_property("psf_l1_error_over_full_flux", float(image_error))
+    assert image_error < 2e-12
 
 
 @pytest.mark.parametrize("backend", ["cpu", "mps"])

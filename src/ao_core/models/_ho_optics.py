@@ -8,7 +8,7 @@ pupil calculation (0396d12, 2e3ff53, a89635c, b0d6faf).
 import numpy as np
 from scipy import fft, ndimage
 
-from ._ho_reconstruction import covariance_kernel, gaussian_basis
+from ._ho_reconstruction import covariance_kernel
 from .optics import (
     _coherence_from_variance_buffer,
     _image_from_otf,
@@ -87,18 +87,6 @@ class OpticalPupil:
         return np.array([waves @ fit.T @ waves.T for fit in self.tilt_fit]).reshape(
             -1, side, side
         )
-
-    def fitted_mirror(self, mirror):
-        basis = gaussian_basis(self.points, mirror.centres, mirror.width)
-        if not len(self.tilt_fit):
-            return basis
-        xyz = np.exp(
-            -((mirror.width * (self.fit_axis[:, None, None] - mirror.centres)) ** 2)
-        )
-        moments = np.einsum(
-            "ya,iyx,xa->ia", xyz[..., 1], self.tilt_fit, xyz[..., 0], optimize=True
-        )
-        return basis - self.ramps.T @ moments
 
     def stationary_moments(self, power, kernels):
         lags = covariance_kernel(power, self.side)

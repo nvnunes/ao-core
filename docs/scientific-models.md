@@ -77,9 +77,10 @@ and `settling_cut` cover scalar feedback and its settling window.
 `HoPsfModel.predict()` takes a `HoPsfRequest` with resolved science
 directions, one wavelength, and detector sampling. For diffraction, supply
 the pupil with `atmosphere=None` and no mirrors. For corrected PSFs, supply
-the atmosphere, guide stars, square lenslets, fitting field, a ground-conjugate
-Gaussian common DM, and the common high-order loop (`high_order_loop`). The
-calculation uses instantaneous noise-free slope measurements and projected
+the atmosphere, guide stars, square lenslets, a ground-conjugate Gaussian
+common DM, and the common high-order loop (`high_order_loop`). The default
+phase-fit reconstructor also uses a fitting field. The calculation uses
+instantaneous noise-free slope measurements and projected
 pseudo-open-loop control. It includes differential refraction and correction
 chromatism.
 
@@ -145,6 +146,70 @@ phase spline planes within a 512 MiB device cache. Cross moments stay on
 Metal through pupil integration, with only the sampled rows copied for
 the CPU precision check. The CPU also handles spline preparation,
 reconstruction, float64 recomputation, and the final detector transform.
+
+### Assemble the High-Order Components
+
+Pass `components` to `HoPsfModel` to select the sensing, mirror,
+reconstruction, and control calculations. The request still carries the
+resolved physical inputs, including loop timing and mirror calibration.
+The following assembly selects the defaults for a common DM and a science DM.
+For common-only correction, omit `science_stage` and configure one DM.
+
+```python
+from dataclasses import replace
+
+from ao_core.models.ho_psf import (
+    DelayedResidualControl,
+    GaussianDm,
+    HoPsfComponents,
+    HoPsfModel,
+    HoPsfRequest,
+    HoPsfStage,
+    MatrixReconstructor,
+    PhaseFitReconstructor,
+    ProjectedPolc,
+    ShackHartmannSensing,
+)
+
+components = HoPsfComponents(
+    sensing=ShackHartmannSensing(),
+    common_stage=HoPsfStage(
+        dm=GaussianDm(),
+        reconstructor=PhaseFitReconstructor(),
+        control=ProjectedPolc(),
+    ),
+    science_stage=HoPsfStage(
+        dm=GaussianDm(),
+        reconstructor=PhaseFitReconstructor(),
+        control=DelayedResidualControl(),
+    ),
+)
+request = HoPsfRequest(config=config)
+model = HoPsfModel(components=components)
+prediction = model.predict(request)
+
+layout = model.command_layout(request, stage="common")
+calibrated = replace(
+    components,
+    common_stage=replace(
+        components.common_stage,
+        reconstructor=MatrixReconstructor(matrix=matrix, layout=layout),
+    ),
+)
+prediction = HoPsfModel(components=calibrated).predict(request)
+```
+
+Arrange the supplied `matrix` with one row per active actuator and columns
+ordered by guide, then x or y slope block, then valid lenslet. Use
+`command_layout()` to get those orders from the resolved geometry. The
+operator maps phase gradients in radians per metre to actuator phase in
+radians at the same wavelength. Pass numerical matrix values in metres.
+A fixed common reconstructor can omit the fitting field. Include any
+command-space tilt projection in the supplied matrix. Sensor-mean removal,
+loop gain and delay, and the
+configured optical tilt policy apply during prediction. When the common
+reconstructor changes, the model also updates the residual slopes driving
+the science DM and propagates both mirrors' correlations with the atmosphere.
 
 This example uses a resolved INI with nominal DM geometry and no varying
 static OPD. For a configuration with calibrated DM geometry, supply

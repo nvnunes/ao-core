@@ -3,11 +3,12 @@ from types import SimpleNamespace
 import numpy as np
 
 from ao_core.models._ho_atmosphere import PhaseLayer
-from ao_core.models._ho_common import Lenslets
 from ao_core.models._ho_optics import OpticalPupil, ResidualCovariance
 from ao_core.models._ho_reconstruction import gaussian_slopes, lenslet_gradient
+from ao_core.models._ho_responses import Lenslets
 from ao_core.models._ho_two_stage import TwoStageCovariance, _stream_covariances
 from ao_core.models.control import polc_transfer
+from ao_core.models.ho_psf import ProjectedPolc
 
 
 def test_stream_covariance_retains_small_positive_variance_after_cancellation():
@@ -69,17 +70,19 @@ def test_two_stage_residual_covariance_matches_direct_phase_subtraction():
         return ((left * power.ravel()) @ right.conj().T).real
 
     unprojected = primary.ravel() * measured
+    interaction = gaussian_slopes(cells, mirror.centres, mirror.width, 1.0, offsets)
     prepare_inputs = (
         grid,
         [layer],
         lenslets,
-        mirror,
+        interaction,
         rows,
         covariance(unprojected, unprojected),
         gain,
+        ProjectedPolc(),
     )
     result = TwoStageCovariance.prepare(*prepare_inputs)
-    feedback = gaussian_slopes(cells, mirror.centres, mirror.width, 1.0, offsets) @ rows
+    feedback = interaction @ rows
     average = np.kron(np.eye(4), np.full((3, 3), 1 / 3))
     identity = np.eye(len(measured))
     projector = identity - average

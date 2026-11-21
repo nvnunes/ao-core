@@ -2,6 +2,10 @@
 
 The small sensor-mean solve follows the project-authored P3 finiteMeanSlopes
 calculation. Products are contracted in the applied actuator basis.
+
+See [Ellerbroek (1994), §§3–4](https://www.oir.caltech.edu/twiki_oir/pub/Keck/NGAO/SingleLGS/Ellerbroek_JOSAA_1994a.pdf)
+for more detail on using phase–command and command covariances to calculate
+closed-loop residual phase statistics.
 """
 
 import numpy as np

@@ -210,7 +210,7 @@ class _PreparedPhaseFit(PreparedReconstructor):
 class PhaseFitReconstructor:
     """Estimate target phase from raw slopes and fit it to the actuator basis.
 
-    The covariance regression follows Eq. (5) of
+    The minimum-variance covariance regression follows Eq. (5) of
     [Correia et al. (2018)](https://arxiv.org/pdf/1806.07938).
     The target is the weighted field phase projected onto the calibrated DM.
     """

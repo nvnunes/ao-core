@@ -394,7 +394,11 @@ class PreparedDm(_PhysicalRecord):
 
 
 class GaussianDm:
-    """A Gaussian influence at each active ground-layer actuator."""
+    """A Gaussian influence at each active ground-layer actuator.
+
+    See [Berdeu et al. (2023)](https://arxiv.org/abs/2306.10803) for more detail
+    on how Gaussian and other influence profiles affect the fitting residual and PSF.
+    """
 
     def prepare(
         self,

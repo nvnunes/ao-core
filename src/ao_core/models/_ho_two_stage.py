@@ -85,7 +85,13 @@ def _stream_covariances(raw, mean_cross, mean_covariance, maps, feedback, gain):
 
 @dataclass(frozen=True)
 class TwoStageCovariance:
-    """Shared slope moments and field-dependent commands for the two DMs."""
+    """Shared slope moments and field-dependent commands for the two DMs.
+
+    See [Morel et al. (2016), §§3–4](https://doi.org/10.1117/12.2232429)
+    for more detail on common–science command covariance in a tomographic model.
+    See [Cerpa-Urra et al. (2022), §2](https://arxiv.org/pdf/2201.11690)
+    for the temporal response of a cascade whose second stage has its own sensor.
+    """
 
     feedback: np.ndarray
     common_covariance: np.ndarray

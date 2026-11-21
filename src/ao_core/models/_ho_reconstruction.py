@@ -230,7 +230,11 @@ def slope_matrix(values, lenslets):
 
 
 def lenslet_covariances(grid, layers, lenslets, inversion_floor, regularization):
-    """Return the common-loop slope covariance and the optional design prior."""
+    """Return the common-loop slope covariance and the optional design prior.
+
+    See [Gendron et al. (2014), §§2–3](https://hdl.handle.net/10754/346823)
+    for more detail on assembling covariance across pairs of projected lenslets.
+    """
     count = lenslets.count
     span = 2 * count - 1
     channels = 2 * len(lenslets.offsets)

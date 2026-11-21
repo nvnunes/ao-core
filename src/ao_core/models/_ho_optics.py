@@ -232,6 +232,8 @@ def coherence_lags(pupil, residual, field=None):
 
     See Eqs. (3)–(4) for the pupil integral with position-dependent
     residual phase differences. [Fétick et al. (2018)](https://arxiv.org/pdf/1809.06785)
+    See [Ellerbroek (1994), Eqs. (4.1)–(4.3)](https://www.oir.caltech.edu/twiki_oir/pub/Keck/NGAO/SingleLGS/Ellerbroek_JOSAA_1994a.pdf)
+    for more detail on evaluating this integral with closed-loop residual covariance.
     """
     lag_origin = np.array(
         [pupil.y.min() - pupil.y.max(), pupil.x.min() - pupil.x.max()]

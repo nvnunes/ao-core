@@ -201,23 +201,17 @@ def decode_ho_psf(ini_source: IniSource, config: Configuration) -> HoPsfConfigur
     spelling is accepted for the estimator setting. The science channel DM
     comes from [DM_science] and the residual high-order loop from [RTC_science].
     When present, [sensor_HO] WfsType must be Shack-Hartmann,
-    ReconstructionModel must be finite_aperture, RemoveMeanSlopes must be
-    true, and NoiseVariance must be zero. [telescope] extraErrorNm must
-    also be zero. Select the detector origin and supply resolved
-    calibration on the returned record.
+    RemoveMeanSlopes must be true, and NoiseVariance must be zero.
+    [telescope] extraErrorNm must also be zero. Select the detector origin
+    and supply resolved calibration on the returned record.
     """
     parser = ini_source.parser
     section = "sensor_HO"
-    for key, supported in (
-        ("WfsType", "shack-hartmann"),
-        ("ReconstructionModel", "finite_aperture"),
-    ):
-        raw = parser.get(section, key, fallback=supported).strip()
-        value = raw.strip("'\"").casefold()
-        if value != supported:
-            raise NotImplementedError(
-                f"HO PSF prediction does not support {section}.{key}={raw}"
-            )
+    wfs_type = parser.get(section, "WfsType", fallback="shack-hartmann").strip()
+    if wfs_type.strip("'\"").casefold() != "shack-hartmann":
+        raise NotImplementedError(
+            f"HO PSF prediction does not support {section}.WfsType={wfs_type}"
+        )
     if not parser.getboolean(section, "RemoveMeanSlopes", fallback=True):
         raise NotImplementedError(
             "HO PSF prediction requires sensor_HO.RemoveMeanSlopes"

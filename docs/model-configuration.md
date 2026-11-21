@@ -83,9 +83,8 @@ determine the inputs and defaults required by their model.
   Both use `LoopGain_HO` and `LoopDelaySteps_HO`. The frame rate comes from
   `[RTC] SensorFrameRate_HO`. If supplied in `[RTC_science]`, the rate must
   match the common high-order loop for an active science DM.
-  The decoder checks explicit HO model options against its square-cell
-  Shack–Hartmann, finite-aperture, mean-slope-removal and zero injected
-  noise assumptions. It accepts `[telescope] extraErrorNm` only at zero.
+  The decoder checks for Shack–Hartmann sensing, mean-slope removal, and
+  zero injected HO noise. It accepts `[telescope] extraErrorNm` only at zero.
   See the [high-order PSF guide](scientific-models.md#high-order-psfs).
 
 ## Extending Configuration

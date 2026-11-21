@@ -1020,7 +1020,6 @@ def test_reject_negative_residual_gain_before_calculating_phase(config):
     "section, key, value",
     [
         ("sensor_HO", "WfsType", "'Pyramid'"),
-        ("sensor_HO", "ReconstructionModel", "'standard'"),
         ("sensor_HO", "RemoveMeanSlopes", "False"),
         ("sensor_HO", "NoiseVariance", "[0.1]"),
         ("telescope", "extraErrorNm", "100"),
